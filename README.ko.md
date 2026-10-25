@@ -17,12 +17,16 @@ hackios-xnu-kernel과 [hackios-xnu-userland](https://github.com/oosexgang/hackio
 컴퓨터 없이 폰의 boot 파티션에서 iOS 16.5가 스스로 부팅한다(`xl install-autoboot`).
 
 - **루트:** 폰 플래시에 있는 iOS 볼륨이다. iOS가 쓴 데이터는 재부팅해도 남는다.
-- **GPU:** Adreno 650이 Mesa/freedreno로 CoreAnimation 화면을 그린다(`gpu=1`).
-- **Wi-Fi:** BCM4375를 Linux의 brcmfmac 드라이버로 쓴다. 호환 계층 위에서 돌아간다(`wifi=1`, [docs/y2q-wifi.md](docs/y2q-wifi.md)).
-- **화면:** 디스플레이 컨트롤러가 프레임을 직접 확대하고, 버퍼를 페이지 플리핑으로 바꿔 패널의 60 Hz에 맞춰 보낸다
-  ([docs/y2q-display.md](docs/y2q-display.md)).
-- **그 밖에:** 터치스크린, 배터리·충전기 정보(MAX77705), CPU 코어 최대 8개.
+- **GPU:** Adreno 650이 Mesa/freedreno로 CoreAnimation 화면을 그린다.
+- **화면:** 디스플레이와 터치 스크린이 작동한다.
+- **그 밖에:** 배터리 정보(MAX77705), CPU 코어 최대 8개.
 - **아직 안 되는 것:** 밝기 조절, 화면 끄기.
+
+## y2q에서 안 되는 것
+
+- **Wi-Fi:** 네트워크가 검색되고 연결까지 되지만, 인터넷이 응답하지 않는다.
+- **충전:** 배터리는 방전만 되고 충전은 안 된다. 기기를 충전하려면 TWRP로 부팅해야 한다.
+- **밝기 조절, 화면 끄기**
 
 ## 저장소에 없는 것과 되살리는 방법
 
