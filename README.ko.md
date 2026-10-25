@@ -22,7 +22,6 @@ hackios-xnu-kernel과 [hackios-xnu-userland](https://github.com/oosexgang/hackio
 - **GPU:** Adreno 650이 Mesa/freedreno로 CoreAnimation 화면을 그린다.
 - **화면:** 디스플레이와 터치 스크린이 작동한다.
 - **그 밖에:** 배터리 정보(MAX77705), CPU 코어 최대 8개.
-- **아직 안 되는 것:** 밝기 조절, 화면 끄기.
 
 ## y2q에서 안 되는 것
 
