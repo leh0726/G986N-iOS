@@ -9,6 +9,8 @@
 !/.gitignore
 !/README.md
 !/LICENSE
+!/LICENSE-userland
+!/README.ko.md
 !/common/
 !/docs/
 !/xl
