@@ -17,10 +17,9 @@ their histories, so one clone is the whole tree.
 iOS 16.5 starts from the phone's boot partition by itself, without a computer (`xl install-autoboot`).
 
 - **Root:** the iOS volume on the phone's flash; data that iOS writes is kept across boots.
-- **GPU:** the Adreno 650 draws for CoreAnimation through Mesa/freedreno (`gpu=1`).
-- **Display:** frames are page-flipped and enlarged by the display controller's own pipes, at the panel's 60 Hz
-  ([docs/y2q-display.md](docs/y2q-display.md)).
-- **Also:** the touch screen, the battery readings (MAX77705), up to 8 CPU cores.
+- **GPU:** the Adreno 650 draws for CoreAnimation through Mesa/freedreno.
+- **Display:** Display and touchscreen works.
+- **Also:** the battery readings (MAX77705), up to 8 CPU cores.
 
 
 ## What does not work on the y2q
