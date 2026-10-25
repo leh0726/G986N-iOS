@@ -194,7 +194,8 @@ flash_root(const char *dev)
 	check(synthetic_dir("/flash/redwood"), "a synthetic /redwood on it, for this image");
 	check(bind_dir(in_image("/LaunchDaemons"), "/flash/System/Library/LaunchDaemons") &&
 	    bind_dir(in_image("/empty"), "/flash/System/Library/NanoLaunchDaemons") &&
-	    bind_dir(in_image("/empty"), "/flash/System/Library/LaunchAngels") &&
+	    /* the angels SpringBoard looks up (PosterBoard, AccessibilityUIServer: userland/build.sh), not iOS's twelve */
+	    bind_dir(in_image("/angels"), "/flash/System/Library/LaunchAngels") &&
 	    bind_dir(in_image("/xpc"), "/flash/System/Library/xpc"), "our launchd jobs, not iOS's");
 	check(bind_dir(in_image("/hal"), "/flash/System/Library/Audio/Plug-Ins/HAL"),
 	    "our audio device, not Apple's plug-ins");

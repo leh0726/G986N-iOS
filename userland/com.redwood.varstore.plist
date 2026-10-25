@@ -6,13 +6,18 @@
 	<string>com.redwood.varstore</string>
 	<!-- with var_store=1 among the kernel's arguments: stays for the run and writes /private/var into
 	     the flash when the kernel says the run is ending (src/var_store.c, watch); without, it ends at
-	     once. An argument after "watch" is seconds between saves of its own accord as well; there is
-	     none by default, because each one costs seconds of the run and a hundred-odd megabytes. -->
+	     once. An argument after "watch" is seconds between saves of its own accord as well: every
+	     600 s, because a boot without the computer is not ended by the kernel but by a power-off,
+	     and one that never gets that far (the battery, a reset) loses no more than ten minutes.
+	     The power-off itself saves on launchd's SIGTERM; ExitTimeOut gives that save the time. -->
 	<key>ProgramArguments</key>
 	<array>
 		<string>/redwood/bin/var_store</string>
 		<string>watch</string>
+		<string>600</string>
 	</array>
+	<key>ExitTimeOut</key>
+	<integer>120</integer>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardOutPath</key>

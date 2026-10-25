@@ -3658,6 +3658,7 @@ static struct {
 	vm_offset_t tables;             /* RADIO_TABLES of them, the root first */
 	uint32_t table_count;
 	uint64_t next;                  /* of the radio's addresses, the first not handed out (from RADIO_ADDRESSES) */
+	uint32_t stream, stream_mask;   /* what the match register takes (radio_space_find()) */
 } radio_space;
 static struct block apps_smmu_second = { "apps smmu", 0, 0x1000 };              /* the second page: a word per context */
 static struct block apps_smmu_context = { "apps smmu, the radio's context", 0, 0x1000 };
@@ -3730,6 +3731,16 @@ radio_space_find(void)
 		printf("wifi: %u: this SMMU numbers its streams with 16 bits, which nothing here is written for\n", step);
 		return false;
 	}
+	/*
+	 * The Galaxy S20+'s hypervisor checks every match register written against streams it knows
+	 * ("SMMU Virt SMR: Invalid SID" in hyp.img) and took nothing of 0x1c00 mask 1: there the radio's
+	 * own stream alone, as Android has it (dt iommu-map: 0x1c01, mask 0; redwood_pcie.c makes the
+	 * controller give the radio's requests that stream). wifi_sid=S, wifi_sid_mask=M: others.
+	 */
+	radio_space.stream = redwood_platform_is("y2q") ? 0x1c01 : RADIO_STREAM;
+	radio_space.stream_mask = redwood_platform_is("y2q") ? 0 : RADIO_STREAM_MASK;
+	PE_parse_boot_argn("wifi_sid", &radio_space.stream, sizeof(radio_space.stream));
+	PE_parse_boot_argn("wifi_sid_mask", &radio_space.stream_mask, sizeof(radio_space.stream_mask));
 	radio_space.page = idr1 >> 31 ? 0x10000 : 0x1000;
 	radio_space.pages = 2u << (idr1 >> 28 & 7);
 	if (2 * radio_space.pages * radio_space.page != 0x100000) {    /* dt: "reg" of apps-smmu */
@@ -3803,14 +3814,15 @@ radio_space_faults(void)
 static bool
 radio_space_on(void)
 {
-	uint32_t smr = SMMU_SMR(radio_space.match), s2cr = SMMU_S2CR(radio_space.match), sees = 1u << 31 | RADIO_STREAM_MASK << 16 |
-	    RADIO_STREAM;
+	uint32_t smr = SMMU_SMR(radio_space.match), s2cr = SMMU_S2CR(radio_space.match), sees = 1u << 31 |
+	    radio_space.stream_mask << 16 | radio_space.stream;
 	uint64_t root = kvtophys(radio_space.tables) | (uint64_t)radio_space.context << 48;     /* tagged with the context's number */
+	bool took;
 
 	printf("wifi: %u: THE SMMU IS ABOUT TO BE WRITTEN: context %u gets page tables of ours (root %#llx) and is switched on, and "
 	    "match register %u sends stream %#x mask %#x through it; before: smr %#x, s2cr %#x, the context's sctlr %#x\n", step,
-	    radio_space.context, root & PTE_ADDRESS, radio_space.match, RADIO_STREAM, RADIO_STREAM_MASK, radio_space.old_smr,
-	    radio_space.old_s2cr, radio_space.old_sctlr);
+	    radio_space.context, root & PTE_ADDRESS, radio_space.match, radio_space.stream, radio_space.stream_mask,
+	    radio_space.old_smr, radio_space.old_s2cr, radio_space.old_sctlr);
 	sleep_ms(pause_ms);
 	put(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR, 0);
 	put(&apps_smmu_second, "cba2r", SMMU_CBA2R(radio_space.context), SMMU_CBA2R_64_BIT);
@@ -3838,14 +3850,16 @@ radio_space_on(void)
 	put(&apps_smmu, "s2cr", s2cr, radio_space.context);
 	put(&apps_smmu, "smr", smr, sees);
 
-	/* the global ones are the hypervisor's to grant: see what it made of them */
-	if (get(&apps_smmu, "smr", smr) != sees || (get(&apps_smmu, "s2cr", s2cr) & 0x300ff) != radio_space.context ||
-	    (get(&apps_smmu_second, "cbar", SMMU_CBAR(radio_space.context)) & 0x30000) != (SMMU_CBAR_STAGE_1 & 0x30000) ||
-	    !(get(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR) & 1) ||
-	    get(&apps_smmu_context, "ttbr0, low", SMMU_CB_TTBR0) != (uint32_t)root ||
-	    get(&apps_smmu_context, "ttbr0, high", SMMU_CB_TTBR0 + 4) != (uint32_t)(root >> 32)) {
+	/* the global ones are the hypervisor's to grant: see what it made of them (each read back, to see which it took) */
+	took = get(&apps_smmu, "smr", smr) == sees;
+	took &= (get(&apps_smmu, "s2cr", s2cr) & 0x300ff) == radio_space.context;
+	took &= (get(&apps_smmu_second, "cbar", SMMU_CBAR(radio_space.context)) & 0x30000) == (SMMU_CBAR_STAGE_1 & 0x30000);
+	took &= (get(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR) & 1) != 0;
+	took &= get(&apps_smmu_context, "ttbr0, low", SMMU_CB_TTBR0) == (uint32_t)root;
+	took &= get(&apps_smmu_context, "ttbr0, high", SMMU_CB_TTBR0 + 4) == (uint32_t)(root >> 32);
+	if (!took) {
 		printf("wifi: %u: THE SMMU DID NOT TAKE WHAT WAS WRITTEN: stream %#x is not going through context %u\n", step,
-		    RADIO_STREAM, radio_space.context);
+		    radio_space.stream, radio_space.context);
 		return false;
 	}
 	get(&apps_smmu_context, "tcr", SMMU_CB_TCR);
@@ -3888,7 +3902,13 @@ radio_map(uint64_t physical, uint64_t size, uint64_t attributes, unsigned long l
 	}
 	*address = RADIO_ADDRESSES + radio_space.next;
 	radio_space.next += size;
-	if (whole) {
+	/*
+	 * The Galaxy S20+'s Broadcom radio (redwood_pcie.c) is on the same kind of SMMU at the same
+	 * address, with the same stream and mask (dt iommu-map of pcie@1c00000: 0x1c00 the root port,
+	 * 0x1c01 the radio) and the same addresses (cnss_pci_iommu_group: 256 MB from 0xa0000000); none
+	 * of the steps above runs there, so asking is wanting.
+	 */
+	if (whole || redwood_platform_is("y2q")) {
 		radio_space.wanted = 2;
 	}
 	if (radio_space.wanted != 2) {
@@ -3918,6 +3938,13 @@ bool
 redwood_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *address)
 {
 	return radio_map(physical, size, RADIO_PTE, address);
+}
+
+/* What the SMMU has refused the radio so far (nothing is said before the stream has a context). */
+void
+redwood_wifi_radio_faults(void)
+{
+	radio_space_faults();
 }
 
 /*
@@ -3976,7 +4003,8 @@ redwood_wifi_dsp_is_up(void)
 }
 
 /*
- * ath11k asks for files by the names Linux's firmware tree has ("ath11k/WCN6750/hw1.0/board.bin");
+ * ath11k asks for files by the names Linux's firmware tree has ("ath11k/WCN6750/hw1.0/board.bin"), and so
+ * does brcmfmac on the Galaxy S20+ ("brcm/brcmfmac4375b1-pcie.bin");
  * this phone has what Android's driver loads (fw-wifi/, see userland/build.sh): its board's own
  * data file and regulatory database, which are what the two names below stand for. The others
  * it asks for first and can do without (a container of several boards' data, a table of the
@@ -3985,7 +4013,10 @@ redwood_wifi_dsp_is_up(void)
 const uint8_t *
 redwood_wifi_driver_file(const char *name, uint64_t *size)
 {
-	static const char *const files[][2] = { { "board.bin", "bd_m20gl.elf" }, { "regdb.bin", "regdb_xiaomi.bin" } };
+	static const char *const files[][2] = { { "board.bin", "bd_m20gl.elf" }, { "regdb.bin", "regdb_xiaomi.bin" },
+		/* the Galaxy S20+'s BCM4375 (B1), for brcmfmac: Android's files (userland/build.sh) */
+		{ "brcmfmac4375b1-pcie.bin", "bcm4375_sta.bin" }, { "brcmfmac4375b1-pcie.txt", "bcm4375_nvram.txt" },
+		{ "brcmfmac4375b1-pcie.clm_blob", "bcm4375_clm.blob" } };
 	const char *last = strrchr(name, '/');
 
 	last = last == NULL ? name : last + 1;
@@ -4116,6 +4147,10 @@ redwood_wifi_stop(void)
 			    "DID NOT SAY IT HAD STOPPED", down ? "has shut it down" : "DID NOT SHUT IT DOWN");
 		}
 	}
+	if (!dsp_started) {
+		redwood_pcie_radio_down();      /* (the Galaxy S20+'s radio has no DSP: powered off, then its stream put back) */
+		radio_space_off();
+	}
 	lck_mtx_unlock(&dsp_lock);
 }
 
@@ -4131,6 +4166,15 @@ void
 redwood_wifi_quiesce(void)
 {
 	redwood_apple80211_summary();           /* (also when the run is ended from the phone: five fingers) */
+	if (!dsp_started) {
+		redwood_pcie_radio_down();      /* (the Galaxy S20+'s radio: no DSP; powered off, so that the next run finds it cold) */
+	}
+	if (!dsp_started && radio_space.on) {
+		leaving = true;                 /* (... and its stream put back) */
+		new_from = ~0u;
+		radio_space_off();
+		return;
+	}
 	if (!dsp_started || dirty) {
 		return;
 	}
@@ -4255,6 +4299,88 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 	thread_terminate(current_thread());
 }
 
+/* With the driver up: one scan, said in the log, then the network of the file (join_given()). */
+static void
+brcm_scan_and_join(uint64_t began)
+{
+	struct redwood_sta_scan scan;
+	struct redwood_sta_bss *bss;
+	unsigned count = 0;
+
+	bzero(&scan, sizeof(scan));
+	if (redwood_sta_ask_scan(&scan) != 0) {
+		tell("wifi: the station takes no scan\n");
+		return;
+	}
+	for (unsigned waited = 0; redwood_sta_busy() && waited < 200; waited++) {
+		sleep_ms(100);
+	}
+	if ((bss = kalloc_data(sizeof(*bss), Z_WAITOK)) != NULL) {
+		while (redwood_sta_heard(count, bss)) {
+			count++;
+		}
+		kfree_data(bss, sizeof(*bss));
+	}
+	tell("wifi: THE SCAN HEARD %u ACCESS POINTS, %llu.%llu s after the kernel began on the radio\n", count,
+	    (now_us() - began) / 1000000, (now_us() - began) / 100000 % 10);
+	join_given(began);
+}
+
+/*
+ * The Galaxy S20+ with wifi=1: its Broadcom radio on PCIe (redwood_pcie.c) and Linux's brcmfmac on it
+ * (redwood_lx.c), on a thread of their own like whole_thread() above. None of this file's steps: the
+ * radio has no DSP, and the driver does from the link up.
+ */
+static void
+brcm_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	uint64_t began = now_us();
+	int error;
+
+	if (redwood_lx_prepare() != 0) {
+		tell("wifi: NO MEMORY FOR THE RADIO in one piece: it is not brought up\n");
+	} else if ((error = redwood_lx_start()) != 0) {
+		tell("wifi: THE RADIO DID NOT COME UP (%d), %llu s in\n", error, (now_us() - began) / 1000000);
+	} else {
+		tell("wifi: THE RADIO IS UP, %llu.%llu s after the kernel began on it\n", (now_us() - began) / 1000000,
+		    (now_us() - began) / 100000 % 10);
+		brcm_scan_and_join(began);
+	}
+	whole_runs = false;
+	thread_terminate(current_thread());
+}
+
+static void
+brcm_init(void)
+{
+	uint32_t on = 0, steps = 0;
+	thread_t thread;
+
+	if (!PE_parse_boot_argn("wifi", &on, sizeof(on)) || on != 1) {
+		return;
+	}
+	if (PE_parse_boot_argn("pcie_step", &steps, sizeof(steps)) && steps != 0) {
+		printf("wifi: wifi=1 with pcie_step=%u: the steps are done, not the driver\n", steps);
+		return;
+	}
+	whole = whole_runs = true;
+	redwood_lx_net_early();
+	if (kernel_thread_start(brcm_thread, NULL, &thread) != KERN_SUCCESS) {
+		whole_runs = false;
+		tell("wifi: no thread: the radio is not brought up\n");
+		return;
+	}
+	thread_deallocate(thread);
+	tell("wifi: the radio (BCM4375, brcmfmac) is being brought up beside the system's start (wifi=1)\n");
+	/* wifi_wait=1: the system's start waits for it (a minute at most), as with pcie_step=N -- for runs without an iOS root */
+	if (PE_parse_boot_argn("wifi_wait", &on, sizeof(on)) && on) {
+		for (unsigned ms = 0; whole_runs && ms < 60000; ms += 10) {
+			sleep_ms(10);
+		}
+		tell("wifi: the system's start goes on (wifi_wait)\n");
+	}
+}
+
 /*
  * Called while the system starts, before there is a root file system. With wifi_step=N the start
  * waits until the steps are over (see redwood_adreno_init()); with wifi=1 it does not.
@@ -4266,6 +4392,10 @@ redwood_wifi_init(void)
 	uint64_t size = 0;
 	thread_t thread;
 
+	if (redwood_platform_is("y2q")) {
+		brcm_init();
+		return;
+	}
 	PE_parse_boot_argn("wifi_step", &last_step, sizeof(last_step));
 	if (last_step == 0 && (!PE_parse_boot_argn("wifi", &on, sizeof(on)) || on == 0)) {
 		return;

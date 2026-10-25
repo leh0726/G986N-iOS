@@ -18,6 +18,10 @@
 #                                   check the host for the tools the build needs
 #   USERLAND_URL=...   where to clone from (default: github.com/oosexgang/hackios-xnu-userland)
 #   USERLAND_REF=...   branch or tag (default: main)
+#
+# A tree whose own repository already carries the userland (G986N-iOS: both repositories' histories
+# merged into one, with the Galaxy S20+ port on top) needs no second checkout: then only the host
+# is checked.
 set -e
 cd "$(dirname "$(readlink -f "$0")")/.."
 ROOT=$PWD
@@ -25,7 +29,10 @@ URL=${USERLAND_URL:-https://github.com/oosexgang/hackios-xnu-userland.git}
 REF=${USERLAND_REF:-main}
 UG=(git --git-dir="$ROOT/.userland.git" --work-tree="$ROOT")
 
-if [ ! -d .userland.git ]; then
+if git ls-files --error-unmatch userland/build.sh >/dev/null 2>&1; then
+	echo "setup: the userland is part of this repository: nothing to clone"
+	UG=(git)
+elif [ ! -d .userland.git ]; then
 	echo "setup: cloning $URL ($REF) into this tree"
 	tmp=$(mktemp -d)
 	git clone --no-checkout --branch "$REF" "$URL" "$tmp/u"
@@ -49,7 +56,7 @@ else
 	cp common/userland.exclude .userland.git/info/exclude
 	"${UG[@]}" pull --ff-only || echo "setup: could not fast-forward the userland checkout (local changes?)"
 fi
-"${UG[@]}" log -1 --format='setup: hackios-xnu-userland at %h (%cs) %s'
+[ -d .userland.git ] && "${UG[@]}" log -1 --format='setup: hackios-xnu-userland at %h (%cs) %s'
 git log -1 --format='setup: hackios-xnu-kernel   at %h (%cs) %s'
 
 # host check: what is missing only matters for the step that needs it

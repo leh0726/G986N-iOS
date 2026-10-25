@@ -300,6 +300,7 @@ public:
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
 	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
+	int panelBackBuffer(const uint8_t * swap, MiniIOSurface ** surfaces);
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
@@ -317,6 +318,741 @@ public:
 };
 
 OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+/*
+ * The display controller behind the framebuffer, on the Galaxy S20+ (y2q, SM8250): its MDSS
+ * (Linux: drivers/gpu/drm/msm/disp/dpu1, whose catalog counts from 0xae01000). The firmware set
+ * it going -- one source pipe fetching 0x9c000000, through a mixer and interface 1 to the DSI
+ * video panel -- and nobody has touched it since. Copying a frame into that one buffer while the
+ * panel reads it tears the picture into bands (the copy takes longer than a refresh), so a frame
+ * is drawn into the buffer the panel is not showing and the pipe is pointed at it: the address
+ * register is double buffered, and what is written to it with a flush of the pipe's bit in the
+ * pipe's control path (CTL0) is taken by the hardware at the start of the next frame, the vertical
+ * blank. The flush bit clears when that has happened; until then the buffer that was on show is
+ * still being read and is not drawn into.
+ *
+ * The second buffer is the other half of the firmware's "Display Reserved" region (0x9c000000,
+ * 36 MB: two frames of 1440 x 3200 fit), which the loader keeps out of the kernel's memory.
+ *
+ * Boot-arg fb_probe=1: before anything, what the controller is doing, into the loader's log (read
+ * only, but for the bus clocks of the registers, turned on if off); fb_probe=2: that, and the pipe
+ * pointed at the second buffer -- a copy of the first with its top third green -- for five
+ * seconds and back. Boot-arg fb_flip=0: one buffer, as before; fb_flip=2: two (see panelInit() for the third).
+ */
+extern "C" bool redwood_platform_is(const char * name);
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+#define PANEL_WIMG_WCOMB        0x6             /* VM_WIMG_WCOMB: as the boot framebuffer is mapped (video_console.c) */
+
+static TUNABLE(uint32_t, gProbe, "fb_probe", 0);
+static TUNABLE(uint32_t, gFlip, "fb_flip", 3);
+/*
+ * Boot-arg fb_te=1: the ping-pong block's tear check set as Linux does. Not needed on the y2q: its
+ * firmware (DisplayDxe, panel AMB622NP01) sends the panel a frame on every second TE pulse by
+ * itself (DSIEnableAutoRefresh, AutoRefreshFrameNumDiv 2: 30 a second of the panel's 60), and what
+ * was written here was not seen to change anything (the read pointer stayed 0).
+ */
+static TUNABLE(uint32_t, gTearCheck, "fb_te", 0);
+static TUNABLE(uint32_t, gKick, "fb_kick", 0);
+/*
+ * Boot-arg fb_hwscale=0: the picture scaled to the panel by the processors, as before. By default
+ * the pipes' own scalers do it (see panelScaled()): a frame is only copied, at the display's size.
+ */
+static TUNABLE(uint32_t, gHwScaleArg, "fb_hwscale", 1);
+/*
+ * Boot-arg fb_autorefresh=N: the panel sent a frame on every N-th of its TE pulses (default 1: all
+ * 60 a second); 0: as the firmware has it (2: 30 a second, half the frames iOS draws never shown).
+ */
+static TUNABLE(uint32_t, gAutorefresh, "fb_autorefresh", 1);  /* 1: frames sent by us at once, not only by whoever sends them 30 times a second */  /* 0: one buffer; 2: two; 3: three */
+
+#define PANEL_FRONT_PHYS        0x9c000000ull   /* the firmware's framebuffer (y2q: "Display Reserved") */
+#define PANEL_BACK_PHYS         0x9d200000ull   /* ... and the second one, in the same region */
+#define PANEL_RESERVED_END      0x9e400000ull
+
+#define GCC_DISP_AHB_CBCR       0x0010b00cull   /* gcc_disp_ahb_clk: the bus clock of the display's clock controller */
+#define DISPCC_BASE             0x0af00000ull
+#define DISPCC_PCLK0_CBCR       0x2004
+#define DISPCC_MDP_CBCR         0x200c
+#define DISPCC_VSYNC_CBCR       0x2024
+#define DISPCC_AHB_CBCR         0x2080          /* the bus clock of the MDSS's registers */
+#define DISPCC_MDSS_GDSCR       0x3000
+#define CBCR_ENABLE             (1u << 0)
+#define CBCR_OFF                (1u << 31)
+#define GDSC_POWER_ON           (1u << 31)
+
+#define MDSS_BASE               0x0ae00000ull
+#define MDSS_SIZE               0x00085000ull
+#define MDP_TOP                 0x01000
+#define MDSS_CTL(n)             (0x02000 + 0x200 * (n))
+#define CTL_TOP                 0x014
+#define CTL_FLUSH               0x018
+#define CTL_INTF_ACTIVE         0x0f4
+#define CTL_FETCH_PIPE_ACTIVE   0x0fc
+#define MDSS_LM(n)              (0x45000 + 0x1000 * (n))
+#define MDSS_INTF1              0x6b800
+#define MDSS_PINGPONG(n)        (0x71000 + 0x800 * (n))
+#define INTF_TEAR_MDP_VSYNC_SEL 0x280           /* (on this controller the tear check is the interface's: Linux's has_intf_te) */
+#define INTF_TEAR_CHECK_EN      0x284
+#define INTF_TEAR_SYNC_CONFIG_VSYNC 0x288
+#define INTF_TEAR_INT_COUNT_VAL 0x298           /* the panel's read pointer */
+#define INTF_TEAR_START_POS     0x2a0
+#define INTF_TEAR_LINE_COUNT    0x2b0           /* the transfer's write pointer */
+#define INTF_TEAR_AUTOREFRESH   0x2b4           /* bit 31: on; bits 0-15: a frame every so many TE pulses */
+#define AUTOREFRESH_ON          (1u << 31)
+#define PP_TEAR_CHECK_EN        0x000
+#define PP_SYNC_CONFIG_VSYNC    0x004           /* bit 19: count lines, bit 20: and start again at the panel's TE */
+#define PP_SYNC_CONFIG_HEIGHT   0x008
+#define PP_SYNC_WRCOUNT         0x00c
+#define PP_VSYNC_INIT_VAL       0x010
+#define PP_SYNC_THRESH          0x018
+#define PP_START_POS            0x01c
+#define PP_RD_PTR_IRQ           0x020
+#define PP_INT_COUNT_VAL        0x014           /* the panel's read pointer: frames << 16 | line */
+#define PP_LINE_COUNT           0x02c           /* the transfer's write pointer */
+#define CTL_START               0x01c
+#define MDP_VSYNC_SEL           0x414           /* (in MDP top) */
+#define VSYNC_CLOCK_HZ          19200000        /* disp_cc_mdss_vsync_clk: from the crystal */
+#define TLMM_NORTH              0x0f900000ull
+#define PANEL_TE_GPIO           66              /* dt: qcom,platform-te-gpio (function 1: mdp_vsync), north tile */
+#define INTF_HSYNC_CTL          0x008
+#define INTF_VSYNC_PERIOD       0x00c
+#define INTF_DISPLAY_V_START    0x01c
+#define INTF_DISPLAY_V_END      0x024
+#define INTF_FRAME_COUNT        0x0ac
+#define INTF_LINE_COUNT         0x0b0
+#define SSPP_SRC_SIZE           0x00
+#define SSPP_OUT_SIZE           0x0c
+#define SSPP_OUT_XY             0x10
+#define SSPP_SRC0_ADDR          0x14
+#define SSPP_SRC_YSTRIDE0       0x24
+#define SSPP_SRC_FORMAT         0x30
+
+#define PANEL_PIPES             8
+static const uint32_t kPipeBase[PANEL_PIPES] = { 0x05000, 0x07000, 0x09000, 0x0b000, 0x25000, 0x27000, 0x29000, 0x2b000 };
+static const uint32_t kPipeFlush[PANEL_PIPES] = { 1u << 0, 1u << 1, 1u << 2, 1u << 18, 1u << 11, 1u << 12, 1u << 24, 1u << 25 };
+static const char * const kPipeName[PANEL_PIPES] = { "vig0", "vig1", "vig2", "vig3", "dma0", "dma1", "dma2", "dma3" };
+
+#define PANEL_LATCH_MS          100             /* a flip not taken by then: the panel has stopped, flipping too */
+#define PANEL_BUFFERS           3
+
+static uint8_t *        gMdss;                  /* the controller's registers, once its clocks are seen running */
+static uint32_t         gPipes;                 /* the pipes that fetch the framebuffer (the firmware: two, a half of the panel each) */
+static uint32_t         gPipeFlush;             /* ... their bits in the flush of the CTL path that has them */
+static int              gCtl = -1;
+static uint64_t         gPanelPhys[PANEL_BUFFERS];      /* the buffers: [0] the firmware's, [1] the second, [2] a third */
+static uint8_t *        gPanelVirt[PANEL_BUFFERS];
+static unsigned         gPanelBuffers;
+static int              gShown;                 /* the buffer the hardware shows (or may: see panelFlip()) */
+static int              gPending = -1;          /* ... the one it has been told to show from the next frame on */
+static int              gNewest;                /* the last one a frame was drawn into */
+static uint64_t         gPendingSince;          /* when the pipe was first told something it has not taken yet */
+static uint32_t         gStatFlips, gStatReplaced;      /* flips told the pipe; of them, put in place of one not taken */
+static uint32_t         gStatPanelFrame;        /* the interface's frame count at the last report */
+static bool             gTe;                    /* the transfers wait for the panel's TE; frames are sent by us (panelKick()) */
+static bool             gHwScale;               /* frames are at the display's size and the pipes scale them to the panel */
+static bool             gScaled;                /* ... and the pipes have been told so */
+static uint32_t         gStatKicks;
+static bool             gFlipping;
+static volatile uint32_t * gGccDispAhb;         /* the clocks, mapped by panelClocks() for panelAlive() */
+static uint8_t *        gDispcc;
+static uint32_t         gAlive[4];              /* what panelAlive() last read */
+
+static inline uint32_t
+mdssRead(uint32_t offset)
+{
+	return *(volatile uint32_t *) (gMdss + offset);
+}
+
+static inline void
+mdssWrite(uint32_t offset, uint32_t value)
+{
+	*(volatile uint32_t *) (gMdss + offset) = value;
+}
+
+/*
+ * Are the controller's registers safe to read: its power switch on and the bus clocks of its
+ * registers running (each turned on if it is not, as Linux keeps them; nothing else is written)?
+ * A block without power or clock does not answer, and the processor waits for it for ever.
+ */
+static bool
+panelClocks(void)
+{
+	vm_offset_t gcc = ml_io_map(trunc_page(GCC_DISP_AHB_CBCR), PAGE_SIZE) + (GCC_DISP_AHB_CBCR & PAGE_MASK);
+	uint8_t * dispcc;
+	uint32_t ahb, gdsc, bus, mdp, vsync, pclk;
+
+	ahb = *(volatile uint32_t *) gcc;
+	if (!(ahb & CBCR_ENABLE)) {
+		*(volatile uint32_t *) gcc = ahb | CBCR_ENABLE;
+		IODelay(1000);
+	}
+	if (!(*(volatile uint32_t *) gcc & CBCR_ENABLE)) {
+		redwood_tl("fb: panel: the display's clock controller has no bus clock (gcc 0x10b00c %#x): one buffer\n", ahb);
+		return false;
+	}
+	dispcc = (uint8_t *) ml_io_map(DISPCC_BASE, 0x4000);
+	gdsc = *(volatile uint32_t *) (dispcc + DISPCC_MDSS_GDSCR);
+	bus = *(volatile uint32_t *) (dispcc + DISPCC_AHB_CBCR);
+	mdp = *(volatile uint32_t *) (dispcc + DISPCC_MDP_CBCR);
+	vsync = *(volatile uint32_t *) (dispcc + DISPCC_VSYNC_CBCR);
+	pclk = *(volatile uint32_t *) (dispcc + DISPCC_PCLK0_CBCR);
+	if (gProbe) {
+		redwood_tl("fb: panel: gcc disp_ahb %#x, dispcc mdss_gdsc %#x ahb %#x mdp %#x vsync %#x pclk0 %#x\n", ahb, gdsc, bus,
+		    mdp, vsync, pclk);
+	}
+	if (!(gdsc & GDSC_POWER_ON) || (mdp & CBCR_OFF)) {
+		redwood_tl("fb: panel: the display block is without power or its clock (gdsc %#x mdp %#x): one buffer\n", gdsc, mdp);
+		return false;
+	}
+	if (bus & CBCR_OFF) {
+		*(volatile uint32_t *) (dispcc + DISPCC_AHB_CBCR) = bus | CBCR_ENABLE;
+		IODelay(1000);
+		bus = *(volatile uint32_t *) (dispcc + DISPCC_AHB_CBCR);
+		if (bus & CBCR_OFF) {
+			redwood_tl("fb: panel: the bus clock of the display block's registers does not run (%#x): one buffer\n", bus);
+			return false;
+		}
+	}
+	gGccDispAhb = (volatile uint32_t *) gcc;
+	gDispcc = dispcc;
+	gAlive[0] = *gGccDispAhb;
+	gAlive[1] = gdsc;
+	gAlive[2] = bus;
+	gAlive[3] = mdp;
+	return true;
+}
+
+/*
+ * Are the controller's power and clocks still as panelClocks() left them? Someone else may take
+ * them away while the system runs (a read of the controller then stops the processor for good), so
+ * this is asked before the controller is touched: the clock controller's bus clock first (GCC
+ * answers always), then what is behind it. A change is said once.
+ */
+static bool
+panelAlive(const char * where)
+{
+	uint32_t now[4];
+
+	now[0] = *gGccDispAhb;
+	if (!(now[0] & CBCR_ENABLE) || (now[0] & CBCR_OFF)) {
+		if (now[0] != gAlive[0]) {
+			redwood_tl("fb: panel: %s: the display's clock controller has lost its bus clock (gcc 0x10b00c %#x, was %#x)\n", where,
+			    now[0], gAlive[0]);
+			gAlive[0] = now[0];
+		}
+		return false;
+	}
+	now[1] = *(volatile uint32_t *) (gDispcc + DISPCC_MDSS_GDSCR);
+	now[2] = *(volatile uint32_t *) (gDispcc + DISPCC_AHB_CBCR);
+	now[3] = *(volatile uint32_t *) (gDispcc + DISPCC_MDP_CBCR);
+	if (memcmp(now, gAlive, sizeof(now)) != 0) {
+		redwood_tl("fb: panel: %s: gcc disp_ahb %#x, mdss_gdsc %#x ahb %#x mdp %#x (were %#x %#x %#x %#x)\n", where, now[0], now[1],
+		    now[2], now[3], gAlive[0], gAlive[1], gAlive[2], gAlive[3]);
+		memcpy(gAlive, now, sizeof(now));
+	}
+	return (now[1] & GDSC_POWER_ON) && !(now[2] & CBCR_OFF) && !(now[3] & CBCR_OFF);
+}
+
+/* fb_probe: what the firmware left the controller doing (false: its clocks went away meanwhile) */
+static bool
+panelSurvey(void)
+{
+	uint32_t frames[2], lines[2], line, frame;
+	uint64_t times[2];
+
+	redwood_tl("fb: panel: mdss hw rev %#x, mdp top hw rev %#x\n", mdssRead(0), mdssRead(MDP_TOP));
+	line = mdssRead(MDSS_INTF1 + INTF_HSYNC_CTL) >> 16;
+	frame = mdssRead(MDSS_INTF1 + INTF_VSYNC_PERIOD);
+	redwood_tl("fb: panel: intf1 en %#x config %#x hsync %#x vsync_period %u v_start %u v_end %u hctl %#x config2 %#x "
+	    "count_en %#x\n", mdssRead(MDSS_INTF1), mdssRead(MDSS_INTF1 + 4), mdssRead(MDSS_INTF1 + INTF_HSYNC_CTL), frame,
+	    mdssRead(MDSS_INTF1 + INTF_DISPLAY_V_START), mdssRead(MDSS_INTF1 + INTF_DISPLAY_V_END), mdssRead(MDSS_INTF1 + 0x3c),
+	    mdssRead(MDSS_INTF1 + 0x60), mdssRead(MDSS_INTF1 + 0xa8));
+	for (int i = 0; i < 2; i++) {
+		frames[i] = mdssRead(MDSS_INTF1 + INTF_FRAME_COUNT);
+		lines[i] = mdssRead(MDSS_INTF1 + INTF_LINE_COUNT);
+		absolutetime_to_nanoseconds(mach_absolute_time(), &times[i]);
+		for (int tenth = 0; i == 0 && tenth < 10; tenth++) {
+			redwood_tl("fb: panel: survey: tenth %d (frame %u)\n", tenth, frames[0]);
+			IOSleep(100);
+			redwood_tl("fb: panel: survey: tenth %d slept\n", tenth);
+			if (!panelAlive("survey")) {
+				return false;
+			}
+		}
+	}
+	redwood_tl("fb: panel: intf1 frame %u line %u, then frame %u line %u %llu us later (%u lines a frame)\n", frames[0], lines[0],
+	    frames[1], lines[1], (times[1] - times[0]) / 1000, line ? frame / line : 0);
+	if (times[1] > times[0]) {
+		/* (a command-mode panel: no timing, the frames counted as they are sent) */
+		uint64_t sent = (uint64_t) (frames[1] - frames[0]) * 1000000000ull * 1000 / (times[1] - times[0]);
+
+		redwood_tl("fb: panel: intf1 counted %llu.%03llu frames a second\n", sent / 1000, sent % 1000);
+	}
+	if (line != 0 && frame >= line && times[1] > times[0]) {
+		uint64_t per = frame / line, gone = (uint64_t) (frames[1] - frames[0]) * per + lines[1] - lines[0];
+		uint64_t rate = gone * 1000000000ull / per * 1000 / (times[1] - times[0]);
+
+		redwood_tl("fb: panel: THE PANEL IS SENT %llu.%03llu FRAMES A SECOND\n", rate / 1000, rate % 1000);
+	}
+	for (int n = 0; n < 6; n++) {
+		uint32_t c = MDSS_CTL(n);
+
+		redwood_tl("fb: panel: ctl%d layer %#x %#x %#x %#x %#x %#x top %#x flush %#x ext %#x %#x intf_active %#x pipe_active %#x "
+		    "%#x %#x\n", n, mdssRead(c), mdssRead(c + 4), mdssRead(c + 8), mdssRead(c + 0xc), mdssRead(c + 0x10),
+		    mdssRead(c + 0x24), mdssRead(c + CTL_TOP), mdssRead(c + CTL_FLUSH), mdssRead(c + 0x40), mdssRead(c + 0x44),
+		    mdssRead(c + CTL_INTF_ACTIVE), mdssRead(c + CTL_FETCH_PIPE_ACTIVE), mdssRead(c + 0x12c), mdssRead(c + 0x130));
+	}
+	for (int n = 0; n < 2; n++) {
+		uint32_t b = MDSS_PINGPONG(n);
+
+		redwood_tl("fb: panel: pingpong%d tear_en %#x vsync %#x height %#x wrcount %#x init %#x int_count %#x thresh %#x start %#x "
+		    "rd_ptr %#x out_line %u line %u autorefresh %#x dsc %#x\n", n, mdssRead(b), mdssRead(b + 4), mdssRead(b + 8),
+		    mdssRead(b + 0xc), mdssRead(b + 0x10), mdssRead(b + 0x14), mdssRead(b + 0x18), mdssRead(b + 0x1c), mdssRead(b + 0x20),
+		    mdssRead(b + 0x28), mdssRead(b + 0x2c), mdssRead(b + 0x30), mdssRead(b + 0xa0));
+	}
+	for (int n = 0; n < 6; n++) {
+		redwood_tl("fb: panel: lm%d op_mode %#x out_size %#x\n", n, mdssRead(MDSS_LM(n)), mdssRead(MDSS_LM(n) + 4));
+	}
+	for (int p = 0; p < PANEL_PIPES; p++) {
+		uint32_t b = kPipeBase[p];
+
+		redwood_tl("fb: panel: %s src_size %#x src_xy %#x out_size %#x out_xy %#x addr %#x stride %u format %#x unpack %#x "
+		    "op_mode %#x\n", kPipeName[p], mdssRead(b), mdssRead(b + 8), mdssRead(b + 0xc), mdssRead(b + 0x10),
+		    mdssRead(b + SSPP_SRC0_ADDR), mdssRead(b + SSPP_SRC_YSTRIDE0), mdssRead(b + SSPP_SRC_FORMAT), mdssRead(b + 0x34),
+		    mdssRead(b + 0x38));
+	}
+	return true;
+}
+
+/*
+ * Send the panel a frame now (it is a command-mode panel: it keeps the last one it was sent and
+ * shows it from its own memory). With the tear check on, the controller holds the transfer until
+ * the panel's scan is out of its way. What the pipe was flushed with is taken at its start.
+ */
+static void
+panelKick(void)
+{
+	mdssWrite(MDSS_CTL(gCtl) + CTL_START, 1);
+	gStatKicks++;
+}
+
+/* Has the pipe taken what it was last told (the flush bits clear)? Then that buffer is the one shown. */
+static void
+panelUpdate(void)
+{
+	if (gPending >= 0 && !(mdssRead(MDSS_CTL(gCtl) + CTL_FLUSH) & gPipeFlush)) {
+		gShown = gPending;
+		gPending = -1;
+	}
+}
+
+/*
+ * The pipes' scalers (QSEED3, version 3.0 on this controller: Linux's dpu_hw_setup_scaler3() with
+ * what _dpu_plane_setup_scaler3() works out for an RGB picture). The firmware has each pipe fetch
+ * its part of the framebuffer at the panel's size -- two pipes, a half of the panel each, the
+ * second one's output at x 720 (the mixers split the source) -- and nothing is scaled. Scaled, a
+ * pipe fetches the columns of the display's picture that its half of the panel shows and enlarges
+ * them, bilinear: the step from one panel pixel to the next is display over panel, in 21 bits of
+ * fraction, and where a half begins between two source columns the scaler starts with that
+ * fraction (the second half: at 562.5 of 1125). The registers are double buffered like the
+ * address: what is written here is taken with the next flush, the address with it.
+ */
+#define SSPP_SCALER             0xa00
+#define QSEED3_OP_ENABLE        (1u << 0)
+#define QSEED3_OP_Y_RGB_BIL     (3u << 16)      /* DPU_SCALE_BIL */
+#define QSEED3_OP_ALPHA_EN      (1u << 10)
+#define QSEED3_OP_ALPHA_BIL     (1u << 29)      /* DPU_SCALE_ALPHA_BIL */
+#define QSEED3_OP_NOT_DX        (1u << 14)
+#define QSEED3_OP_BLEND         (1u << 31)
+#define QSEED3_PRELOAD_VALUE    (4u | 2u << 8 | 4u << 16 | 2u << 24)    /* DPU_QSEED4_DEFAULT_PRELOAD_H, _V */
+#define PHASE_SHIFT             21
+#define SRC_FORMAT_ALPHA        (1u << 8)       /* SRCC3_EN: the format has alpha */
+
+/* every register of a pipe that scaling changes: the pipe's rectangles, its pixel extension, its scaler */
+static const uint16_t kPipeScaleRegs[] = {
+	0x000, 0x008, 0x00c, 0x010,                                             /* src size, src xy, out size, out xy */
+	0x100, 0x104, 0x108, 0x110, 0x114, 0x118, 0x120, 0x124, 0x128,         /* SW_PIX_EXT C0, C1C2, C3: LR, TB, REQ_PIXELS */
+	SSPP_SCALER + 0x04, SSPP_SCALER + 0x10, SSPP_SCALER + 0x14, SSPP_SCALER + 0x18, SSPP_SCALER + 0x1c, SSPP_SCALER + 0x20,
+	SSPP_SCALER + 0x40, SSPP_SCALER + 0x44, SSPP_SCALER + 0x48,
+	SSPP_SCALER + 0x90, SSPP_SCALER + 0x94, SSPP_SCALER + 0x98, SSPP_SCALER + 0x9c,
+};
+#define PIPE_SCALE_REGS         (sizeof(kPipeScaleRegs) / sizeof(kPipeScaleRegs[0]))
+static uint32_t gPipeFirmware[PANEL_PIPES][PIPE_SCALE_REGS];   /* as the firmware left them */
+static uint32_t gPipeScaledRegs[PANEL_PIPES][PIPE_SCALE_REGS]; /* ... and scaled */
+
+static void
+pipeScaledSet(uint32_t * regs, uint32_t offset, uint32_t value)
+{
+	for (unsigned i = 0; i < PIPE_SCALE_REGS; i++) {
+		if (kPipeScaleRegs[i] == offset) {
+			regs[i] = value;
+		}
+	}
+}
+
+/*
+ * Work out the scaled registers of the pipes, for a picture of `width` x `height` on the panel's
+ * `panelWidth` x `panelHeight`. False: these pipes cannot do it (a DMA pipe has no scaler, or a
+ * pipe's part of the panel is not a whole column of it).
+ */
+static bool
+panelScaled(uint32_t width, uint32_t height, uint32_t panelWidth, uint32_t panelHeight)
+{
+	uint32_t stepX = (uint32_t) (((uint64_t) width << PHASE_SHIFT) / panelWidth);
+	uint32_t stepY = (uint32_t) (((uint64_t) height << PHASE_SHIFT) / panelHeight);
+
+	if (width > panelWidth || height > panelHeight || (gPipes & ~0xfu) != 0) {
+		return false;
+	}
+	for (int p = 0; p < PANEL_PIPES; p++) {
+		uint32_t b = kPipeBase[p], * regs = gPipeScaledRegs[p], outX, outW, outH, srcX, srcW, last, init, op;
+		uint64_t first;
+
+		if (!(gPipes & (1u << p))) {
+			continue;
+		}
+		for (unsigned i = 0; i < PIPE_SCALE_REGS; i++) {
+			gPipeFirmware[p][i] = regs[i] = mdssRead(b + kPipeScaleRegs[i]);
+		}
+		outX = mdssRead(b + SSPP_OUT_XY) & 0xffff;
+		outW = mdssRead(b + SSPP_OUT_SIZE) & 0xffff;
+		outH = mdssRead(b + SSPP_OUT_SIZE) >> 16;
+		if ((mdssRead(b + SSPP_OUT_XY) >> 16) != 0 || outH != panelHeight || outW == 0 || outX + outW > panelWidth) {
+			redwood_tl("fb: panel: %s shows %ux%u at %#x of the panel: not scaled by the pipes\n", kPipeName[p], outW, outH,
+			    mdssRead(b + SSPP_OUT_XY));
+			return false;
+		}
+		/* the source columns its panel columns fall on: from the one under the first, to the one after the last's */
+		first = (uint64_t) outX * stepX;
+		srcX = (uint32_t) (first >> PHASE_SHIFT);
+		init = (uint32_t) (first & ((1u << PHASE_SHIFT) - 1));
+		last = (uint32_t) (((uint64_t) (outX + outW - 1) * stepX) >> PHASE_SHIFT) + 2;
+		srcW = (last < width ? last : width) - srcX;
+		op = QSEED3_OP_ENABLE | QSEED3_OP_Y_RGB_BIL | QSEED3_OP_NOT_DX | QSEED3_OP_BLEND;
+		if (mdssRead(b + SSPP_SRC_FORMAT) & SRC_FORMAT_ALPHA) {
+			op |= QSEED3_OP_ALPHA_EN | QSEED3_OP_ALPHA_BIL;
+		}
+		pipeScaledSet(regs, SSPP_SRC_SIZE, height << 16 | srcW);
+		pipeScaledSet(regs, 0x008, srcX);
+		for (uint32_t pe = 0x100; pe <= 0x128; pe += 4) {
+			pipeScaledSet(regs, pe, (pe & 0xf) == 8 ? (height << 16 | srcW) : 0);
+		}
+		pipeScaledSet(regs, SSPP_SCALER + 0x04, op);
+		pipeScaledSet(regs, SSPP_SCALER + 0x10, stepX);
+		pipeScaledSet(regs, SSPP_SCALER + 0x14, stepY);
+		pipeScaledSet(regs, SSPP_SCALER + 0x18, stepX);
+		pipeScaledSet(regs, SSPP_SCALER + 0x1c, stepY);
+		pipeScaledSet(regs, SSPP_SCALER + 0x20, QSEED3_PRELOAD_VALUE);
+		pipeScaledSet(regs, SSPP_SCALER + 0x40, height << 16 | srcW);
+		pipeScaledSet(regs, SSPP_SCALER + 0x44, height << 16 | srcW);
+		pipeScaledSet(regs, SSPP_SCALER + 0x48, outH << 16 | outW);
+		pipeScaledSet(regs, SSPP_SCALER + 0x90, init);
+		pipeScaledSet(regs, SSPP_SCALER + 0x94, 0);
+		pipeScaledSet(regs, SSPP_SCALER + 0x98, init);
+		pipeScaledSet(regs, SSPP_SCALER + 0x9c, 0);
+		redwood_tl("fb: panel: %s: scaler version %#x (op mode %#x); scaled: columns %u to %u of %u (phase %#x) onto %u at %u, "
+		    "step %#x x %#x\n", kPipeName[p], mdssRead(b + SSPP_SCALER), gPipeFirmware[p][13], srcX, srcX + srcW - 1, width, init,
+		    outW, outX, stepX, stepY);
+	}
+	return true;
+}
+
+/* The pipes told to scale (or to show the panel's size as the firmware had them), from the next flush on. */
+static void
+panelScale(bool scaled)
+{
+	for (int p = 0; p < PANEL_PIPES; p++) {
+		if (gPipes & (1u << p)) {
+			for (unsigned i = 0; i < PIPE_SCALE_REGS; i++) {
+				mdssWrite(kPipeBase[p] + kPipeScaleRegs[i], scaled ? gPipeScaledRegs[p][i] : gPipeFirmware[p][i]);
+			}
+		}
+	}
+	gScaled = scaled;
+}
+
+/*
+ * Point the pipe at buffer `which`: taken by the hardware at the next frame's start. A flip told
+ * before and not taken yet is replaced: its buffer is never shown and is free again -- unless a
+ * frame began while the pipe was being told (the interface's frame count moved), when it may have
+ * been taken just before; it is then counted as shown, until the pipe is seen to take this one.
+ */
+static void
+panelFlip(unsigned which)
+{
+	uint32_t before, after, waiting;
+
+	__builtin_arm_dsb(0xf);                 /* (the frame's pixels in memory before the hardware is told of them) */
+	before = mdssRead(MDSS_INTF1 + INTF_FRAME_COUNT);
+	waiting = mdssRead(MDSS_CTL(gCtl) + CTL_FLUSH) & gPipeFlush;
+	if (gHwScale != gScaled) {
+		panelScale(gHwScale);           /* (the first frame at the display's size; or, on the way out, the panel's again) */
+	}
+	for (int p = 0; p < PANEL_PIPES; p++) {
+		if (gPipes & (1u << p)) {
+			mdssWrite(kPipeBase[p] + SSPP_SRC0_ADDR, (uint32_t) gPanelPhys[which]);
+		}
+	}
+	mdssWrite(MDSS_CTL(gCtl) + CTL_FLUSH, gPipeFlush);
+	if (gTe && gKick) {
+		panelKick();
+	}
+	after = mdssRead(MDSS_INTF1 + INTF_FRAME_COUNT);
+	gStatFlips++;
+	gStatReplaced += gPending >= 0 && waiting && after == before;
+	if (gPending < 0 || !waiting || after != before) {
+		if (gPending >= 0) {
+			gShown = gPending;
+		}
+		gPendingSince = mach_absolute_time();
+	}
+	gPending = (int) which;
+	gNewest = (int) which;
+}
+
+/* Has the last flip been taken (the buffer shown before it no longer read)? Waits up to `ms`. */
+static bool
+panelLatched(uint32_t ms)
+{
+	uint64_t deadline;
+
+	clock_interval_to_deadline(ms, kMillisecondScale, &deadline);
+	while (mdssRead(MDSS_CTL(gCtl) + CTL_FLUSH) & gPipeFlush) {
+		if (mach_absolute_time() > deadline) {
+			return false;
+		}
+		IODelay(100);
+	}
+	panelUpdate();
+	return true;
+}
+
+/* fb_probe=2: the second buffer on show for five seconds, and back */
+static void
+panelFlipTest(uint32_t rowBytes, uint32_t width, uint32_t height)
+{
+	uint64_t began, latched;
+	uint32_t lineAt, frameAt;
+	bool taken;
+
+	for (uint32_t y = 0; y < height; y++) {
+		uint32_t * to = (uint32_t *) (gPanelVirt[1] + (size_t) y * rowBytes);
+
+		if (y < height / 3) {
+			for (uint32_t x = 0; x < width; x++) {
+				to[x] = 0xff00c000;
+			}
+		} else {
+			memcpy(to, gPanelVirt[0] + (size_t) y * rowBytes, (size_t) width * 4);
+		}
+	}
+	began = mach_absolute_time();
+	panelFlip(1);
+	taken = panelLatched(PANEL_LATCH_MS);
+	latched = mach_absolute_time();
+	lineAt = mdssRead(MDSS_INTF1 + INTF_LINE_COUNT);
+	frameAt = mdssRead(MDSS_INTF1 + INTF_FRAME_COUNT);
+	redwood_tl("fb: panel: flip test: the pipe at %#llx, %s after %llu us (intf1 frame %u line %u); the top third is green "
+	    "for five seconds\n", gPanelPhys[1], taken ? "taken" : "NOT TAKEN", micros(latched) - micros(began), frameAt, lineAt);
+	for (int tenth = 0; tenth < 50; tenth++) {
+		IOSleep(100);
+		if (!panelAlive("flip test")) {
+			return;
+		}
+	}
+	redwood_tl("fb: panel: flip test: intf1 frame %u; back to the firmware's buffer\n", mdssRead(MDSS_INTF1 + INTF_FRAME_COUNT));
+	panelFlip(0);
+	taken = panelLatched(PANEL_LATCH_MS);
+	redwood_tl("fb: panel: flip test: back %s\n", taken ? "(taken)" : "NOT TAKEN");
+}
+
+/*
+ * How often the panel is sent a frame. Its firmware has the interface do it by itself, on every
+ * second TE pulse of the panel's 60 (AutoRefreshFrameNumDiv 2 in DisplayDxe's AMB622NP01): 30
+ * frames a second, and of the 60 that iOS draws a second, half are never shown -- uneven motion,
+ * and up to 33 ms before a frame is. A frame is sent in some 8 ms (DSC at 3:1 over four lanes at
+ * 1157 Mbit/s), well inside a refresh, so the interface is told to send one on every pulse.
+ */
+static void
+panelAutorefresh(void)
+{
+	uint32_t config = mdssRead(MDSS_INTF1 + INTF_TEAR_AUTOREFRESH), frames[2];
+	uint64_t times[2];
+
+	redwood_tl("fb: panel: intf1 tear check: en %#x vsync_sel %#x sync %#x read pointer %#x start %u write pointer %u; "
+	    "autorefresh %#x\n", mdssRead(MDSS_INTF1 + INTF_TEAR_CHECK_EN), mdssRead(MDSS_INTF1 + INTF_TEAR_MDP_VSYNC_SEL),
+	    mdssRead(MDSS_INTF1 + INTF_TEAR_SYNC_CONFIG_VSYNC), mdssRead(MDSS_INTF1 + INTF_TEAR_INT_COUNT_VAL),
+	    mdssRead(MDSS_INTF1 + INTF_TEAR_START_POS), mdssRead(MDSS_INTF1 + INTF_TEAR_LINE_COUNT), config);
+	if (!(config & AUTOREFRESH_ON) || gAutorefresh == 0 || gAutorefresh > 0xffff || (config & 0xffff) == gAutorefresh) {
+		return;
+	}
+	mdssWrite(MDSS_INTF1 + INTF_TEAR_AUTOREFRESH, AUTOREFRESH_ON | gAutorefresh);
+	for (int i = 0; i < 2; i++) {
+		if (i == 1) {
+			IODelay(500000);
+		}
+		frames[i] = mdssRead(MDSS_INTF1 + INTF_FRAME_COUNT);
+		times[i] = mach_absolute_time();
+	}
+	redwood_tl("fb: panel: autorefresh %#x now (was %#x): %u frames sent in %llu ms\n", mdssRead(MDSS_INTF1 + INTF_TEAR_AUTOREFRESH),
+	    config, frames[1] - frames[0], (micros(times[1]) - micros(times[0])) / 1000);
+}
+
+/*
+ * The panel's TE line: a pulse at the start of each of its own refreshes. Polled for 100 ms, its
+ * rising edges are counted: how many times a second the panel really refreshes, and whether it
+ * says so at all (0: no TE, or the pin is not the controller's).
+ */
+static uint32_t
+panelTeRate(void)
+{
+	uint64_t phys = TLMM_NORTH + 0x1000ull * PANEL_TE_GPIO;
+	volatile uint32_t * pin = (volatile uint32_t *) (ml_io_map(trunc_page(phys), PAGE_SIZE) + (phys & PAGE_MASK));
+	uint32_t config = pin[0], edges = 0, high = 0, polls = 0, level, was;
+	uint64_t began = mach_absolute_time(), now, until;
+
+	if ((config >> 2 & 0xf) != 1) {
+		redwood_tl("fb: panel: GPIO%u is not the panel's TE (config %#x): frames are sent as before\n", PANEL_TE_GPIO, config);
+		return 0;
+	}
+	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &until);
+	until += began;
+	was = pin[1] & 1;
+	do {
+		level = pin[1] & 1;
+		edges += level && !was;
+		high += level;
+		polls++;
+		was = level;
+		now = mach_absolute_time();
+	} while (now < until);
+	redwood_tl("fb: panel: GPIO%u (TE, config %#x): %u rising edges in 100 ms, high in %u of %u reads; MDP vsync_sel %#x\n",
+	    PANEL_TE_GPIO, config, edges, high, polls, mdssRead(MDP_TOP + MDP_VSYNC_SEL));
+	return edges * 10;
+}
+
+/*
+ * The tear check of the ping-pong block behind the mixers (Linux's dpu_hw_pp_enable_te() with
+ * what dpu_encoder_phys_cmd_tearcheck_config() works out): the block counts the panel's lines
+ * from its TE on and starts a transfer only where the panel's scan does not run into it. The
+ * line rate it counts with is the vsync clock over lines a frame and frames a second.
+ */
+static void
+panelTearCheck(uint32_t teHz, uint32_t height)
+{
+	uint32_t pp = MDSS_PINGPONG(0), total = height + 32, count = VSYNC_CLOCK_HZ / (total * teHz);
+
+	mdssWrite(pp + PP_SYNC_CONFIG_VSYNC, (1u << 19) | (1u << 20) | count);
+	mdssWrite(pp + PP_SYNC_CONFIG_HEIGHT, total * 2);
+	mdssWrite(pp + PP_VSYNC_INIT_VAL, height);
+	mdssWrite(pp + PP_RD_PTR_IRQ, height + 1);
+	mdssWrite(pp + PP_START_POS, height);
+	mdssWrite(pp + PP_SYNC_THRESH, 4u << 16 | 4);
+	mdssWrite(pp + PP_SYNC_WRCOUNT, height + 4 + 1);
+	mdssWrite(pp + PP_TEAR_CHECK_EN, 1);
+	redwood_tl("fb: panel: tear check on (pingpong0: %u lines of %u vsync clocks, %u a second)\n", total, count, teHz);
+	IODelay(20000);
+	redwood_tl("fb: panel: pingpong0's read pointer now %#x, write pointer %u\n", mdssRead(pp + PP_INT_COUNT_VAL),
+	    mdssRead(pp + PP_LINE_COUNT));
+}
+
+/*
+ * Find the pipe that shows the framebuffer and get the second buffer ready. Two buffers only on
+ * the y2q, its controller running, a pipe fetching the framebuffer whose rows are the framebuffer's.
+ */
+static void
+panelInit(uint32_t rowBytes, uint32_t width, uint32_t height, uint32_t displayWidth, uint32_t displayHeight)
+{
+	uint64_t size = (uint64_t) rowBytes * height;
+
+	if (!redwood_platform_is("y2q") || vinfo.v_physaddr != PANEL_FRONT_PHYS || PANEL_BACK_PHYS + size > PANEL_RESERVED_END) {
+		return;
+	}
+	if (!panelClocks()) {
+		return;
+	}
+	gMdss = (uint8_t *) ml_io_map(MDSS_BASE, MDSS_SIZE);
+	if (gProbe && !panelSurvey()) {
+		redwood_tl("fb: panel: one buffer\n");
+		return;
+	}
+	for (int p = 0; p < PANEL_PIPES; p++) {
+		if (mdssRead(kPipeBase[p] + SSPP_SRC0_ADDR) == (uint32_t) PANEL_FRONT_PHYS) {
+			if ((mdssRead(kPipeBase[p] + SSPP_SRC_YSTRIDE0) & 0xffff) != rowBytes) {
+				gPipes = 0;
+				break;
+			}
+			gPipes |= 1u << p;
+			gPipeFlush |= kPipeFlush[p];
+		}
+	}
+	/* the CTL path whose mixers take that pipe: the first active one (the firmware has one) */
+	for (int n = 0; n < 6 && gCtl < 0; n++) {
+		if (mdssRead(MDSS_CTL(n) + CTL_INTF_ACTIVE) != 0 || mdssRead(MDSS_CTL(n) + CTL_TOP) != 0) {
+			gCtl = n;
+		}
+	}
+	if (gPipes == 0 || gCtl < 0) {
+		redwood_tl("fb: panel: no pipe shows the framebuffer as it is (pipes %#x ctl %d): one buffer\n", gPipes, gCtl);
+		return;
+	}
+	gPanelPhys[0] = PANEL_FRONT_PHYS;
+	gPanelPhys[1] = PANEL_BACK_PHYS;
+	gPanelVirt[0] = (uint8_t *) vinfo.v_baseaddr;
+	/* (18 MB: more than the kernel's I/O map holds, which ml_io_map() takes from) */
+	gPanelVirt[1] = (uint8_t *) ml_io_map_unmappable(PANEL_BACK_PHYS, size, PANEL_WIMG_WCOMB);
+	gPanelBuffers = 2;
+	if (gFlip >= 3) {
+		/*
+		 * A third, from the kernel's memory: the panel takes a frame some 30 times a second, and
+		 * with two buffers the next frame cannot be drawn until the last flip is taken -- up to
+		 * 33 ms of waiting for every frame, the swaps behind it held up. With three there is always
+		 * one neither shown nor about to be. (The pipe's address register has 32 bits.)
+		 */
+		IOBufferMemoryDescriptor * third = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+		    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache, size, 0x00000000fffff000ull);
+
+		if (third != NULL && third->getPhysicalSegment(0, NULL) + size <= 0x100000000ull) {
+			gPanelPhys[2] = third->getPhysicalSegment(0, NULL);
+			gPanelVirt[2] = (uint8_t *) third->getBytesNoCopy();
+			gPanelBuffers = 3;
+		} else {
+			redwood_tl("fb: panel: no memory under 4 GB for a third buffer: two\n");
+		}
+	}
+	gShown = gNewest = 0;
+	gPending = -1;
+	redwood_tl("fb: panel: the framebuffer is fetched by pipes %#x (ctl%d, flush bits %#x); %s (%u buffers%s%llx)\n", gPipes, gCtl,
+	    gPipeFlush, gFlip ? "frames are drawn into another buffer and flipped to at a frame's start" : "one buffer (fb_flip=0)",
+	    gPanelBuffers, gPanelBuffers > 2 ? ", the third at " : "", gPanelBuffers > 2 ? gPanelPhys[2] : 0);
+	if (gProbe >= 2) {
+		panelFlipTest(rowBytes, width, height);
+	}
+	gFlipping = gFlip != 0;
+	gHwScale = gFlipping && gHwScaleArg && (displayWidth != width || displayHeight != height) &&
+	    panelScaled(displayWidth, displayHeight, width, height);
+	panelAutorefresh();
+	if (gFlipping && gTearCheck) {
+		uint32_t teHz = panelTeRate();
+
+		if (teHz >= 20 && teHz <= 130) {
+			panelTearCheck(teHz, height);
+			gTe = true;
+		}
+	}
+}
+
+/* On the way back to the loader: the firmware's buffer on show again, which is the one the loader and a panic draw on. */
+extern "C" void
+MiniIOMobileFramebufferQuiesce(void)
+{
+	if (gMdss != NULL && gPipes != 0 && (gShown != 0 || gNewest != 0 || gScaled) && panelAlive("the return to the loader")) {
+		gHwScale = false;               /* (and the pipes at the panel's size again: the loader draws at it) */
+		panelFlip(0);
+	}
+}
 
 static void
 setNumber(OSDictionary * dict, const char * key, uint64_t value)
@@ -441,6 +1177,13 @@ IOMobileFramebuffer::start(IOService * provider)
 				node->release();
 			}
 		}
+	}
+	panelInit(fRowBytes, fPanelWidth, fPanelHeight, fWidth, fHeight);
+	if (gHwScale) {
+		/* (the pipes scale the frames to the panel: here they are drawn at the display's size, into its top left) */
+		IOLog("MiniIOMobileFramebuffer: the panel's %ux%u is scaled to by its pipes\n", fPanelWidth, fPanelHeight);
+		fPanelWidth = fWidth;
+		fPanelHeight = fHeight;
 	}
 	fColumn = IONewZero(uint32_t, fPanelWidth);
 	fColumnWeight = IONewZero(uint16_t, fPanelWidth);
@@ -674,6 +1417,7 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 			}
 		}
 	}
+	__builtin_arm_dsb(0xf);                 /* (these rows in memory before the flip that shows them, made on another processor) */
 }
 
 /* A helper of the scaling (fb_threads): waits for rows to do, does them, says so. */
@@ -927,6 +1671,66 @@ IOMobileFramebuffer::presenter(void)
 	}
 }
 
+/*
+ * Where a frame is drawn: with two buffers (panelInit()), into the one not on show, once the panel
+ * has stopped reading it -- the flip away from it taken at a frame's start; its number, for
+ * panelFlip() when the frame is in it. A frame whose bottom layer does not cover the whole panel
+ * leaves some of the buffer as it was, frames ago: the newest one is copied into it first
+ * (slowly: that memory is not cached). -1: one buffer, the one on show.
+ */
+int
+IOMobileFramebuffer::panelBackBuffer(const uint8_t * swap, MiniIOSurface ** surfaces)
+{
+	MiniIOSurface * s = surfaces[0];
+	int32_t src[4], dst[4];
+	uint64_t waited;
+	int back;
+	bool covered;
+
+	if (!gFlipping) {
+		return -1;
+	}
+	if (!panelAlive("a frame")) {
+		/* (the controller is off: nothing is on show, whichever buffer the frame goes to) */
+		fBase = gPanelVirt[gNewest];
+		return -1;
+	}
+	panelUpdate();
+	if (gTe && gKick && gPending >= 0) {
+		panelKick();                    /* (the last kick came while a frame was being sent, and was not taken) */
+	}
+	if (gPending >= 0 && gPanelBuffers == 2) {
+		panelLatched(PANEL_LATCH_MS);
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - gPendingSince, &waited);
+	if (gPending >= 0 && waited >= PANEL_LATCH_MS * NSEC_PER_MSEC) {
+		redwood_tl("fb: panel: a flip was not taken in %u ms: one buffer from now on\n", PANEL_LATCH_MS);
+		gFlipping = false;
+		fBase = gPanelVirt[gPending];
+		return -1;
+	}
+	for (back = 0; back == gShown || back == gPending; back++) {
+	}
+	fBase = gPanelVirt[back];
+	memcpy(src, swap + SWAP_SOURCE(0), sizeof(src));
+	memcpy(dst, swap + SWAP_DEST(0), sizeof(dst));
+	if (swapWord(swap, SWAP_SURFACE(0)) == 0) {
+		covered = (swapWord(swap, SWAP_LAYERS_SET) & 1) && fGraphics;       /* (made black: see show()) */
+	} else {
+		covered = s != NULL && s->info.bytesPerElement == 4 && s->info.planeCount == 0 &&
+		    (src[2] <= 0 || src[3] <= 0 || (src[0] >= 0 && src[1] >= 0 && (uint32_t) (src[0] + src[2]) <= s->info.width &&
+		    (uint32_t) (src[1] + src[3]) <= s->info.height)) &&
+		    (dst[2] <= 0 || dst[3] <= 0 || (dst[0] <= 0 && dst[1] <= 0 && (uint32_t) (dst[0] + dst[2]) >= fWidth &&
+		    (uint32_t) (dst[1] + dst[3]) >= fHeight));
+	}
+	if (!covered) {
+		for (uint32_t y = 0; y < fPanelHeight; y++) {
+			memcpy(fBase + (size_t) y * fRowBytes, gPanelVirt[gNewest] + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
+		}
+	}
+	return back;
+}
+
 /* A swap's surfaces onto the panel, once the GPU is done with them. */
 void
 IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
@@ -935,7 +1739,8 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn;
 	uint32_t layers = 0;
 	MiniIOSurface * recorded = NULL;
-	bool report;
+	bool report, drew = false;
+	int back;
 
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
@@ -945,7 +1750,8 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	fStatWaiting += mach_absolute_time() - began;
 	began = ready = mach_absolute_time();
-	if (gOnTheBeat) {
+	if (gOnTheBeat && !gFlipping) {
+		/* (with buffers flipped the pipe takes a frame at the panel's own beat: none of ours is needed) */
 		uint64_t period, aim, next;
 
 		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
@@ -989,6 +1795,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	fLastFrame = began;
 	report = fSwapsShown < 8;
+	back = panelBackBuffer(swap, surfaces);
 	if (report) {
 		IOLog("MiniIOMobileFramebuffer: swap %u (#%u): surfaces %u %u %u %u, layers set 0x%x cleared 0x%x\n",
 		    swapWord(swap, SWAP_ID), fSwapsShown, swapWord(swap, SWAP_SURFACE(0)), swapWord(swap, SWAP_SURFACE(1)),
@@ -1013,6 +1820,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				for (uint32_t y = 0; y < fPanelHeight; y++) {
 					bzero(fBase + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
 				}
+				drew = true;
 			}
 			continue;
 		}
@@ -1037,10 +1845,14 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				PE_initialize_console(NULL, kPEGraphicsMode);
 			}
 			drawLayer(s, src, dst);
+			drew = true;
 			if (layer == 0) {
 				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
 			}
 		}
+	}
+	if (drew && back >= 0) {
+		panelFlip((unsigned) back);     /* (on show from the next frame's start) */
 	}
 	drawn = mach_absolute_time();
 	if (recorded != NULL) {
@@ -1079,6 +1891,17 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
 		    fStatHeld, fStatLost, fStatSwapsLate);
 		fStatSwapsLate = 0;
+		if (gFlipping) {
+			uint32_t panelFrame = mdssRead(MDSS_INTF1 + INTF_FRAME_COUNT);
+
+			/* (the kernel's own log does not reach the loader's in a whole boot) */
+			redwood_tl("fb: %u frames in %llu ms, %llu us each in the driver; %u flips, %u of them in place of one the panel had "
+			    "not taken; the panel was sent %u frames (%u kicks)\n", fStatFrames, nanos / NSEC_PER_MSEC,
+			    drawing / fStatFrames / NSEC_PER_USEC, gStatFlips, gStatReplaced, gStatPanelFrame != 0 ? panelFrame - gStatPanelFrame : 0,
+			    gStatKicks);
+			gStatPanelFrame = panelFrame;
+			gStatFlips = gStatReplaced = gStatKicks = 0;
+		}
 		for (different = 0; different < 8 && fStatSurfaces[different] != 0; different++) {
 		}
 		if (different == 8 && fStatFrames > 8) {

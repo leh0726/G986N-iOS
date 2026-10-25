@@ -11,6 +11,11 @@
  * answer, which knows the phone.
  *
  * A kernel built without the object has the lx_start() at the end of this file, which says so.
+ *
+ * The Galaxy S20+'s radio is Broadcom's, on PCIe, and its driver Linux's brcmfmac (tools/mk-brcmfmac.sh),
+ * built the same way into an object of its own that shows the same four names with lx_brcm_ in front;
+ * both objects are linked when they are there, and the phone's name chooses. What brcmfmac asks of
+ * the PCIe link is redwood_pcie.c's to answer.
  */
 #include <kern/clock.h>
 #include <kern/kalloc.h>
@@ -258,6 +263,7 @@ struct lx_frame {
 };
 
 static bool lx_link_attached;
+static bool lx_brcm;                            /* the driver is Broadcom's (the Galaxy S20+), not ath11k */
 static LCK_MTX_DECLARE(lx_queue_lock, &lx_lock_group);
 static struct lx_frame *lx_queue;
 static uint32_t lx_queue_in, lx_queue_out;      /* frames put in and taken out, counted from the start */
@@ -275,7 +281,7 @@ lx_queue_runs(__unused void *parameter, __unused wait_result_t result)
 		}
 		frame = &lx_queue[lx_queue_out % LX_QUEUE];     /* (stays ours until lx_queue_out moves) */
 		lck_mtx_unlock(&lx_queue_lock);
-		lx_transmit(frame->bytes, frame->length);
+		lx_brcm ? lx_brcm_transmit(frame->bytes, frame->length) : lx_transmit(frame->bytes, frame->length);
 		lck_mtx_lock(&lx_queue_lock);
 		lx_queue_out++;
 		lck_mtx_unlock(&lx_queue_lock);
@@ -306,7 +312,7 @@ lx_link_transmit(mbuf_t packet, size_t length)
 }
 
 static struct redwood_net_link lx_link = {
-	.name = "the phone's radio (ath11k)",
+	.name = "the phone's radio",
 	.wireless = true,
 	.transmit = lx_link_transmit,
 };
@@ -521,6 +527,38 @@ lx_os_irq_count(unsigned vector)
 	return vector < LX_VECTORS && lx_irq_first != 0 ? gic_v3_spi_count(lx_irq_first + vector) : 0;
 }
 
+/* ---- a radio on PCIe (redwood_pcie.c) ------------------------------------------------------------------- */
+
+int
+lx_os_pci_up(unsigned *id, unsigned *class_revision, unsigned long long bar[2], unsigned long long bar_size[2])
+{
+	uint64_t at[2], size[2];
+	uint32_t i, c;
+
+	if (!redwood_platform_is("y2q") || !redwood_pcie_radio_up(&i, &c, at, size)) {
+		return ENXIO;
+	}
+	*id = i;
+	*class_revision = c;
+	for (unsigned b = 0; b < 2; b++) {
+		bar[b] = at[b];
+		bar_size[b] = size[b];
+	}
+	return 0;
+}
+
+unsigned
+lx_os_pci_config_read(unsigned offset, unsigned width)
+{
+	return redwood_pcie_config_read(offset, width);
+}
+
+void
+lx_os_pci_config_write(unsigned offset, unsigned value, unsigned width)
+{
+	redwood_pcie_config_write(offset, value, width);
+}
+
 /* ---- the station (sys/redwood_sta.h) --------------------------------------------------------------------- */
 
 void
@@ -563,20 +601,55 @@ lx_transmit(__unused const unsigned char *frame, __unused unsigned long length)
 	return ENXIO;
 }
 
+__attribute__((weak)) int
+lx_brcm_start(void)
+{
+	say("lx: THE DRIVER IS NOT BUILT IN: its object was not there when this kernel was built (tools/mk-brcmfmac.sh, "
+	    "then build the kernel again)\n");
+	return ENXIO;
+}
+
+__attribute__((weak)) void
+lx_brcm_stop(void)
+{
+}
+
+__attribute__((weak)) int
+lx_brcm_prepare(void)
+{
+	return 0;
+}
+
+__attribute__((weak)) int
+lx_brcm_transmit(__unused const unsigned char *frame, __unused unsigned long length)
+{
+	return ENXIO;
+}
+
+/* The Galaxy S20+'s radio is Broadcom's, on PCIe: its driver is brcmfmac; everywhere else ath11k. */
+static bool
+lx_is_brcm(void)
+{
+	if (!lx_brcm && redwood_platform_is("y2q")) {
+		lx_brcm = true;
+	}
+	return lx_brcm;
+}
+
 int
 redwood_lx_start(void)
 {
-	return lx_start();
+	return lx_is_brcm() ? lx_brcm_start() : lx_start();
 }
 
 void
 redwood_lx_stop(void)
 {
-	lx_stop();
+	lx_is_brcm() ? lx_brcm_stop() : lx_stop();
 }
 
 int
 redwood_lx_prepare(void)
 {
-	return lx_prepare();
+	return lx_is_brcm() ? lx_brcm_prepare() : lx_prepare();
 }

@@ -1,0 +1,96 @@
+--- a/brcmfmac/chip.c	2026-10-25 09:10:08.399010605 +0900
++++ b/brcmfmac/chip.c	2026-10-25 09:10:08.423158573 +0900
+@@ -741,6 +741,7 @@
+ 	case BRCM_CC_43751_CHIP_ID:
+ 	case BRCM_CC_43752_CHIP_ID:
+ 	case BRCM_CC_4377_CHIP_ID:
++	case BRCM_CC_4375_CHIP_ID:
+ 		return 0x170000;
+ 	case BRCM_CC_4378_CHIP_ID:
+ 		return 0x352000;
+--- a/brcmfmac/pcie.c	2026-10-25 09:10:08.399076715 +0900
++++ b/brcmfmac/pcie.c	2026-10-25 09:10:08.424613475 +0900
+@@ -68,6 +68,7 @@
+ BRCMF_FW_DEF(4371, "brcmfmac4371-pcie");
+ BRCMF_FW_CLM_DEF(43752, "brcmfmac43752-pcie");
+ BRCMF_FW_CLM_DEF(4377B3, "brcmfmac4377b3-pcie");
++BRCMF_FW_CLM_DEF(4375B1, "brcmfmac4375b1-pcie");
+ BRCMF_FW_CLM_DEF(4378B1, "brcmfmac4378b1-pcie");
+ BRCMF_FW_CLM_DEF(4378B3, "brcmfmac4378b3-pcie");
+ BRCMF_FW_CLM_DEF(4387C2, "brcmfmac4387c2-pcie");
+@@ -109,6 +110,7 @@
+ 	BRCMF_FW_ENTRY(BRCM_CC_4371_CHIP_ID, 0xFFFFFFFF, 4371),
+ 	BRCMF_FW_ENTRY(BRCM_CC_43752_CHIP_ID, 0xFFFFFFFF, 43752),
+ 	BRCMF_FW_ENTRY(BRCM_CC_4377_CHIP_ID, 0xFFFFFFFF, 4377B3), /* revision ID 4 */
++	BRCMF_FW_ENTRY(BRCM_CC_4375_CHIP_ID, 0xFFFFFFFF, 4375B1), /* revision ID 5 */
+ 	BRCMF_FW_ENTRY(BRCM_CC_4378_CHIP_ID, 0x0000000F, 4378B1), /* revision ID 3 */
+ 	BRCMF_FW_ENTRY(BRCM_CC_4378_CHIP_ID, 0xFFFFFFE0, 4378B3), /* revision ID 5 */
+ 	BRCMF_FW_ENTRY(BRCM_CC_4387_CHIP_ID, 0xFFFFFFFF, 4387C2), /* revision ID 7 */
+@@ -1686,6 +1688,49 @@
+ 	memcpy_toio(devinfo->tcm + address, randbuf, BRCMF_RANDOM_SEED_LENGTH);
+ }
+ 
++static u32 brcmf_pcie_buscore_read32(void *ctx, u32 addr);
++static void brcmf_pcie_buscore_write32(void *ctx, u32 addr, u32 value);
++
++/* The PMU's resource limit and ChipCommon's fast clock (HT) before the ARM runs:
++ * the BCM4375's firmware as left by the boot chain never gets HT otherwise.
++ */
++#define BRCMF_PMU_CAPABILITIES		0x604
++#define BRCMF_PMU_MAX_RES_MASK		0x61c
++#define BRCMF_CLK_CTL_ST		0x1e0
++#define BRCMF_CCS_FORCEHT		0x2
++#define BRCMF_CCS_HTAVAIL		0x20000
++
++static void brcmf_pcie_4375_clocks(struct brcmf_pciedev_info *devinfo)
++{
++	struct brcmf_bus *bus = dev_get_drvdata(&devinfo->pdev->dev);
++	struct brcmf_core *pmu = brcmf_chip_get_pmu(devinfo->ci);
++	struct brcmf_core *cc = brcmf_chip_get_chipcommon(devinfo->ci);
++	u32 count, mask, i;
++
++	count = (brcmf_pcie_buscore_read32(devinfo, pmu->base +
++					   BRCMF_PMU_CAPABILITIES) >> 8) & 0x1f;
++	mask = count >= 31 ? 0x7fffffff : (1u << count) - 1;
++	brcmf_pcie_buscore_write32(devinfo, pmu->base + BRCMF_PMU_MAX_RES_MASK,
++				   mask);
++	msleep(10);
++	brcmf_pcie_buscore_write32(devinfo, cc->base + BRCMF_CLK_CTL_ST,
++				   brcmf_pcie_buscore_read32(devinfo, cc->base +
++							     BRCMF_CLK_CTL_ST) |
++				   BRCMF_CCS_FORCEHT);
++	for (i = 0; i < 100; i++) {
++		if (brcmf_pcie_buscore_read32(devinfo, cc->base +
++					      BRCMF_CLK_CTL_ST) &
++		    BRCMF_CCS_HTAVAIL)
++			break;
++		usleep_range(1000, 2000);
++	}
++	brcmf_err(bus, "BCM4375: max_res_mask %#x, clk_ctl_st %#x\n",
++		  brcmf_pcie_buscore_read32(devinfo, pmu->base +
++					    BRCMF_PMU_MAX_RES_MASK),
++		  brcmf_pcie_buscore_read32(devinfo, cc->base +
++					    BRCMF_CLK_CTL_ST));
++}
++
+ static int brcmf_pcie_download_fw_nvram(struct brcmf_pciedev_info *devinfo,
+ 					const struct firmware *fw, void *nvram,
+ 					u32 nvram_len)
+@@ -1749,6 +1794,9 @@
+ 	sharedram_addr_written = brcmf_pcie_read_ram32(devinfo,
+ 						       devinfo->ci->ramsize -
+ 						       4);
++	if (devinfo->ci->chip == BRCM_CC_4375_CHIP_ID)
++		brcmf_pcie_4375_clocks(devinfo);
++
+ 	brcmf_dbg(PCIE, "Bring ARM in running state\n");
+ 	err = brcmf_pcie_exit_download_state(devinfo, resetintr);
+ 	if (err)
+@@ -2747,6 +2795,7 @@
+ 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4371_DEVICE_ID, WCC),
+ 	BRCMF_PCIE_DEVICE(BRCM_PCIE_43596_DEVICE_ID, CYW),
+ 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4377_DEVICE_ID, WCC_SEED),
++	BRCMF_PCIE_DEVICE(BRCM_PCIE_4375_DEVICE_ID, WCC_SEED),
+ 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4378_DEVICE_ID, WCC_SEED),
+ 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4387_DEVICE_ID, WCC_SEED),
+ 	BRCMF_PCIE_DEVICE(BRCM_PCIE_43752_DEVICE_ID, WCC_SEED),

@@ -1508,6 +1508,10 @@ redwood_goodix_init(void)
 	if (!PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled)) || !enabled) {
 		return;
 	}
+	/* every address here is redwood's: its clocks, its supply, its serial engine */
+	if (!redwood_platform_is("redwood")) {
+		return;
+	}
 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
 	if (kernel_thread_start(goodix_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);

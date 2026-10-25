@@ -1334,11 +1334,53 @@ bootok(void)
 	return ok;
 }
 
+/*
+ * A boot with no computer on the other end ends by the phone being powered off from iOS, not by
+ * the kernel going back to the loader: launchd ends every job with SIGTERM first (and SIGKILL
+ * after the job's ExitTimeOut, com.redwood.varstore.plist), and that is the watcher's cue to save
+ * while /private/var is still whole. libmini has no signals, so this is the kernel's interface as
+ * it is (bsd/dev/arm/unix_signal.c, sendsig): the handler is entered through a trampoline of ours
+ * with the catcher, the style, the signal, the info, the context and a token in x0..x5, and the
+ * trampoline gives the context back with sigreturn.
+ */
+#define SYS_SIGACTION           46
+#define SYS_SIGRETURN           184
+#define SIGTERM_NUMBER          15
+
+static volatile int terminated;
+
+struct kernel_sigaction {
+	void (*handler)(int);
+	void (*tramp)(void (*)(int), int, int, void *, void *, long);
+	uint32_t mask;
+	int flags;
+};
+
+static void
+on_term(int sig)
+{
+	(void)sig;
+	terminated = 1;
+}
+
+static void
+signal_tramp(void (*handler)(int), int style, int sig, void *info, void *context, long token)
+{
+	(void)info;
+	handler(sig);
+	mini_syscall(SYS_SIGRETURN, (long)context, style, token, 0, 0, 0);
+}
+
 static int
 watch(int seconds)
 {
 	uint64_t last = 0;
 	int asked = 0;
+	struct kernel_sigaction action = { on_term, signal_tramp, 0, 0 };
+
+	if (mini_syscall(SYS_SIGACTION, SIGTERM_NUMBER, (long)&action, 0, 0, 0, 0) != 0) {
+		printf("var_store: no SIGTERM handler: a power-off will not save\n");
+	}
 
 	fd = open(DEVICE, O_RDWR, 0);
 	if (fd < 0) {
@@ -1374,11 +1416,18 @@ watch(int seconds)
 			asked = 1;
 		}
 		gettimeofday(&tv, NULL);
-		if (asked || (seconds > 0 && (uint64_t)tv.tv_sec - last >= (uint64_t)seconds)) {
-			int ok = save_once();
+		if (terminated || asked || (seconds > 0 && (uint64_t)tv.tv_sec - last >= (uint64_t)seconds)) {
+			int ok;
 
+			if (terminated) {
+				printf("var_store: the system is shutting down: saving the data volume\n");
+			}
+			ok = save_once();
 			if (!ok) {
 				printf("var_store: this save came to nothing; the store keeps what it had\n");
+			}
+			if (terminated) {
+				return ok;
 			}
 			last = (uint64_t)tv.tv_sec;
 			if (asked) {

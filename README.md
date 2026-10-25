@@ -1,3 +1,52 @@
+# G986N-iOS — HackiOS on the Galaxy S20+ (SM-G986N)
+
+This repository is [HackiOS](https://github.com/oosexgang/hackios-xnu-kernel) with a port to the **Samsung
+Galaxy S20+ 5G (y2q, SM-G986N, Snapdragon 865)**. Both of HackiOS's repositories, hackios-xnu-kernel and
+[hackios-xnu-userland](https://github.com/oosexgang/hackios-xnu-userland), are in it with their histories, so one
+clone is the whole tree. The rest of this README is HackiOS's own; this section is about the y2q.
+
+On the y2q, iOS 16.5 starts from the phone's boot partition without a computer (`xl install-autoboot`):
+- **Root:** the iOS volume on the phone's flash.
+- **GPU:** Adreno 650 drawing for CoreAnimation (`gpu=1`).
+- **Wi-Fi:** BCM4375 through Linux's brcmfmac (`wifi=1`, [docs/y2q-wifi.md](docs/y2q-wifi.md)).
+- **Display:** page-flipped and scaled by the display controller at the panel's 60 Hz
+  ([docs/y2q-display.md](docs/y2q-display.md)).
+- **Also working:** the touch screen, battery and charger readings (MAX77705), and data kept across boots.
+
+### What the repository leaves out, and how it comes back
+
+Nothing big, nothing of Apple's and nothing of the phone's own is in git (see `.gitignore`, a whitelist). One script
+fetches or builds all of it, in order, skipping what is already there:
+
+```sh
+common/bootstrap.sh y2q
+```
+
+| Left out | ~Size | Made by |
+|---|---|---|
+| iOS 16.5 (`ios165/`) | 18 GB | `ios165/fetch.sh`: from Apple's IPSW, on your machine |
+| Apple's XNU sources (`xnu-src/`) | 0.5 GB | `xnu/apply.sh`: Apple's tag + `xnu/redwood.patch` + `xnu/files/` |
+| the kernel's dependencies and SDK (`xnu-deps/build`, ...) | 1.2 GB | `xnu-deps/setup.sh` |
+| Mu-Silicium with our UEFI ports (`Mu-Silicium/`) | 6 GB | `uefi/apply.sh`, then `build_uefi.py -d y2q` |
+| the y2q's GPU and Wi-Fi firmware, its MAC address (`fw-gpu/`, `fw-wifi-y2q/`) | 5 MB | `tools/y2q-firmware.sh`, from the phone in TWRP |
+| images, kernel and boot images (`userland/*.apfs`, `out/`) | 2.5 GB | `common/build.sh y2q FLASHBOOT=1 CRYPTEXES=flash` |
+
+Needs: Linux x86-64, ~40 GB of disk, theos with `iPhoneOS16.5.sdk` (for the kernel and our programs), the packages
+of Mu-Silicium's `setup_env.sh` (for the UEFI), `adb` and a y2q with TWRP. Keep a backup of the phone's own boot
+image first. `XL_DEVICE=y2q ./xl restore-boot FILE` puts it back from TWRP.
+
+Then, with the phone in TWRP:
+
+```sh
+XL_DEVICE=y2q ./xl install-autoboot   # writes out/y2q-autoboot.img to the boot partition (asks first)
+```
+
+A volume key during the loader's two-second wait gives the USB commands instead (`XL_DEVICE=y2q ./xl run`, ...).
+The port's notes: `common/devices/y2q.conf`, [docs/y2q-wifi.md](docs/y2q-wifi.md),
+[docs/y2q-display.md](docs/y2q-display.md).
+
+---
+
 # HackiOS — XNU kernel
 
 **HackiOS** boots Apple's open-source **XNU kernel** (`xnu-8796.121.2`, the kernel of iOS 16.5) on Android phone

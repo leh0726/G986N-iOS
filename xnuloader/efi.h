@@ -88,10 +88,18 @@ typedef struct {
 	void (EFIAPI *reset_system)(int type, efi_status status, uint64_t size, void *data);
 } efi_runtime_services;
 
+/* the console's keys (UEFI 12.3): on a phone, the volume keys come as the arrows, power as Enter */
+typedef struct { uint16_t scan_code; char16 unicode_char; } efi_input_key;
+typedef struct efi_text_input {
+	efi_status (EFIAPI *reset)(struct efi_text_input *self, uint8_t extended);
+	efi_status (EFIAPI *read_key_stroke)(struct efi_text_input *self, efi_input_key *key);
+	void *wait_for_key;
+} efi_text_input;
+
 typedef struct {
 	efi_table_header hdr;
 	char16 *vendor; uint32_t revision; uint32_t pad;
-	efi_handle con_in_handle; void *con_in;
+	efi_handle con_in_handle; efi_text_input *con_in;
 	efi_handle con_out_handle; efi_text_output *con_out;
 	efi_handle stderr_handle; efi_text_output *std_err;
 	efi_runtime_services *rt;
@@ -258,5 +266,22 @@ typedef struct {
 #define EFI_PARTITION_INFO_GUID { 0x8cf2f62c, 0xbc9b, 0x4821, { 0x80, 0x8d, 0xec, 0x9e, 0xc4, 0x21, 0xa1, 0xa0 } }
 #define QCOM_CHARGER_EX_GUID     { 0x6edc8a6d, 0x2663, 0x43cd, { 0x90, 0xff, 0x46, 0x21, 0xff, 0xd1, 0x0d, 0xf5 } }
 #define QCOM_CHARGER_GUID        { 0x21bfb78b, 0x02ea, 0x4ab7, { 0x99, 0x40, 0xb5, 0x8a, 0x2a, 0xd6, 0x58, 0x29 } }
+#define QCOM_TLMM_GUID           { 0xad9aec18, 0x7bf0, 0x4809, { 0x9e, 0x96, 0x30, 0x12, 0x30, 0x9f, 0x3d, 0xf7 } }
+
+/* Qualcomm's pin controller (EFITlmm.h; y2q's TLMMDxe has it at revision 1): no This, a pin's
+ * configuration in one word, TLMM_GPIO_CFG */
+struct qcom_tlmm {
+	uint64_t revision;
+	efi_status (EFIAPI *config_gpio)(uint32_t config, uint32_t enable);
+	efi_status (EFIAPI *config_gpio_group)(uint32_t enable, uint32_t *configs, uint32_t count);
+	efi_status (EFIAPI *gpio_in)(uint32_t config, uint32_t *value);
+	efi_status (EFIAPI *gpio_out)(uint32_t config, uint32_t value);
+	efi_status (EFIAPI *set_inactive_config)(uint32_t gpio, uint32_t config);
+};
+#define TLMM_GPIO_CFG(gpio, function, output, pull, drive) \
+	(((gpio) & 0x3ffu) << 4 | ((function) & 0xfu) | ((output) & 1u) << 14 | ((pull) & 3u) << 15 | \
+	((drive) & 0xfu) << 17 | 0x20000000u)
+#define TLMM_PULL_UP            3
+#define TLMM_16MA               7
 
 #endif /* XNULOADER_EFI_H */

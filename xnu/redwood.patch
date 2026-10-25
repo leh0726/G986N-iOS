@@ -62,16 +62,19 @@ index a4d25040f38f..aad72993d139 100644
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..9cd24b42caca 100644
+index 44274016a4cf..3e5886408ad9 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,37 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,40 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
 +bsd/dev/redwood_input.c		standard
 +bsd/dev/redwood_virtio_input.c	standard
 +bsd/dev/redwood_goodix.c	standard
++bsd/dev/redwood_sec_ts.c	standard
++bsd/dev/redwood_max77705.c	standard
++bsd/dev/redwood_pcie.c	standard
 +bsd/dev/redwood_buttons.c	standard
 +bsd/dev/redwood_battery.c	standard
 +bsd/dev/redwood_ufs.c	standard
@@ -103,7 +106,7 @@ index 44274016a4cf..9cd24b42caca 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +186,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +189,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -118,7 +121,7 @@ index 44274016a4cf..9cd24b42caca 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +400,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +403,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -126,7 +129,7 @@ index 44274016a4cf..9cd24b42caca 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +423,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +426,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -2179,30 +2182,35 @@ index 94e91306b143..0ec1323086b7 100644
  #endif
  
 diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
-index e76e7e70ab9c..4f540f8caf43 100644
+index e76e7e70ab9c..36b5e87a432a 100644
 --- a/osfmk/arm64/machine_routines.c
 +++ b/osfmk/arm64/machine_routines.c
-@@ -734,6 +734,9 @@ ml_get_machine_mem(void)
+@@ -734,6 +734,10 @@ ml_get_machine_mem(void)
  	return machine_info.memory_size;
  }
  
 +extern void loader_return(void);
++extern void loader_return_power(bool restart);
 +extern void redwood_adreno_stop(void);
 +
  __attribute__((noreturn))
  void
  halt_all_cpus(boolean_t reboot)
-@@ -745,6 +748,9 @@ halt_all_cpus(boolean_t reboot)
+@@ -745,6 +749,13 @@ halt_all_cpus(boolean_t reboot)
  		printf("CPU halted\n");
  		PEHaltRestart(kPEHaltCPU);
  	}
-+	/* No platform driver powers the machine off: hand control (and the log) back to the loader. */
++	/*
++	 * No platform driver powers the machine off: hand control (and the log) back to the loader, and
++	 * tell it which of the two it was -- without the computer it then turns the phone off.
++	 */
 +	redwood_adreno_stop();
++	loader_return_power(reboot);
 +	loader_return();
  	while (1) {
  		;
  	}
-@@ -932,6 +938,99 @@ ml_read_chip_revision(unsigned int *rev __unused)
+@@ -932,6 +943,99 @@ ml_read_chip_revision(unsigned int *rev __unused)
  #endif
  }
  
@@ -2302,7 +2310,7 @@ index e76e7e70ab9c..4f540f8caf43 100644
  void
  ml_parse_cpu_topology(void)
  {
-@@ -945,6 +1044,7 @@ ml_parse_cpu_topology(void)
+@@ -945,6 +1049,7 @@ ml_parse_cpu_topology(void)
  	int64_t cluster_max_cpu_phys_id[MAX_CPU_CLUSTER_PHY_ID + 1];
  	const boolean_t cpus_boot_arg_present = PE_parse_boot_argn("cpus", &cpu_boot_arg, sizeof(cpu_boot_arg));
  	const boolean_t cpumask_boot_arg_present = PE_parse_boot_argn("cpumask", &cpumask_boot_arg, sizeof(cpumask_boot_arg));
@@ -2310,7 +2318,7 @@ index e76e7e70ab9c..4f540f8caf43 100644
  
  	// The cpus=N and cpumask=N boot args cannot be used simultaneously. Flag this
  	// so that we trigger a panic later in the boot process, once serial is enabled.
-@@ -1005,6 +1105,20 @@ ml_parse_cpu_topology(void)
+@@ -1005,6 +1110,20 @@ ml_parse_cpu_topology(void)
  		cpu->phys_id = (uint32_t)ml_readprop(child, "reg", ML_READPROP_MANDATORY);
  
  		cpu->l2_access_penalty = (uint32_t)ml_readprop(child, "l2-access-penalty", 0);
@@ -2331,7 +2339,7 @@ index e76e7e70ab9c..4f540f8caf43 100644
  		cpu->l2_cache_size = (uint32_t)ml_readprop(child, "l2-cache-size", 0);
  		cpu->l2_cache_id = (uint32_t)ml_readprop(child, "l2-cache-id", 0);
  		cpu->l3_cache_size = (uint32_t)ml_readprop(child, "l3-cache-size", 0);
-@@ -1107,6 +1221,7 @@ ml_parse_cpu_topology(void)
+@@ -1107,6 +1226,7 @@ ml_parse_cpu_topology(void)
  	cluster_offsets[0] = 0;
  #endif
  	assert(topology_info.boot_cpu != NULL);
@@ -2339,7 +2347,7 @@ index e76e7e70ab9c..4f540f8caf43 100644
  	ml_read_chip_revision(&topology_info.chip_revision);
  
  	/*
-@@ -1427,17 +1542,15 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
+@@ -1427,17 +1547,15 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
  	processor_t processor = PERCPU_GET_RELATIVE(processor, cpu_data, this_cpu_datap);
  	if (!is_boot_cpu) {
  		processor_init(processor, this_cpu_datap->cpu_number, pset);
@@ -2365,7 +2373,7 @@ index e76e7e70ab9c..4f540f8caf43 100644
  
  	*processor_out = processor;
  	*ipi_handler_out = cpu_signal_handler;
-@@ -2237,8 +2350,16 @@ _enable_virtual_timer(void)
+@@ -2237,8 +2355,16 @@ _enable_virtual_timer(void)
  	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
  
  	__builtin_arm_wsr64("CNTV_CTL_EL0", cntvctl);

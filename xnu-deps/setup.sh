@@ -122,6 +122,19 @@ stage1() {
 	done
 	link "$CCTOOLS/ld" host/bin/ld64
 	link xnu-clang host/bin/xnu-clang++
+	# makesyscalls.sh writes "\(" in its awk strings: gawk makes that "(", mawk 1.3.4 (Debian and
+	# Ubuntu's default awk) leaves the backslash, and init_sysent.c does not compile
+	if ! awk --version 2>/dev/null | grep -q "GNU Awk"; then
+		command -v gawk > /dev/null || die "gawk is needed (the system's awk is not GNU awk): install gawk"
+		link "$(command -v gawk)" host/bin/awk
+	fi
+	# xcrun -find looks in host/bin and /usr/bin only; Debian and Ubuntu keep dsymutil with LLVM's own tools
+	if [ ! -x /usr/bin/dsymutil ]; then
+		d=$(ls -d /usr/lib/llvm-*/bin/dsymutil 2>/dev/null | sort -V | tail -1)
+		[ -n "$d" ] || d=$(command -v dsymutil)
+		[ -n "$d" ] || die "dsymutil is needed (package llvm)"
+		link "$d" host/bin/dsymutil
+	fi
 
 	# --- the SDK -------------------------------------------------------------------------------
 	# The makefiles ask xcrun (ours: host/bin/xcrun) for an SDK and a platform directory.

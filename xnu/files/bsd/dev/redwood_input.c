@@ -13,6 +13,7 @@
 #include <sys/systm.h>
 #include <sys/uio.h>
 #include <pexpert/pexpert.h>
+#include <pexpert/device_tree.h>
 
 #define TOUCH_QUEUE     512             /* records; a power of two */
 
@@ -70,6 +71,7 @@ static uint32_t touch_head, touch_tail;        /* read from head, add at tail */
 #define EXIT_HOLD_MS    1500
 
 extern void loader_return(void);
+extern void redwood_var_save_on_return(void);   /* bsd/dev/redwood_ufs.c: the data volume into the flash */
 
 static thread_call_t exit_call;
 static uint32_t fingers_down;           /* one bit for each finger a driver says is down */
@@ -78,6 +80,7 @@ static void
 exit_hold_elapsed(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	printf("\n--- %d fingers held on the screen for %d ms: back to the loader ---\n", EXIT_FINGERS, EXIT_HOLD_MS);
+	redwood_var_save_on_return();           /* the way out of a boot without the computer: keep what iOS wrote */
 	redwood_adreno_stop();
 	loader_return();
 }
@@ -205,6 +208,24 @@ static const struct cdevsw touch_cdevsw = {
 	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
 };
 
+/*
+ * Which phone this is: the loader names its platform in /arm-io's device_type ("redwood",
+ * "y2q", "qemu-virt"). A driver that writes to one phone's addresses asks this first.
+ */
+bool
+redwood_platform_is(const char *name)
+{
+	DTEntry entry;
+	void const *type;
+	unsigned int size;
+
+	if (SecureDTLookupEntry(NULL, "/arm-io", &entry) != kSuccess ||
+	    SecureDTGetProperty(entry, "device_type", &type, &size) != kSuccess) {
+		return false;
+	}
+	return strncmp(type, name, size) == 0 && strlen(name) + 1 == size;
+}
+
 void
 redwood_input_init(void)
 {
@@ -217,8 +238,11 @@ redwood_input_init(void)
 	redwood_cpufreq_init();
 	redwood_virtio_input_init();
 	redwood_goodix_init();
+	redwood_sec_ts_init();
 	redwood_buttons_init();
 	redwood_battery_init();
+	redwood_max77705_init();
+	redwood_pcie_init();
 	redwood_ufs_init();
 	redwood_net_init();
 	redwood_adreno_init();

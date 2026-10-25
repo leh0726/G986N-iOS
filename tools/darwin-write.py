@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write an image into the phone's darwin partition, and nowhere else, from Android (adb, root).
+"""Write an image into the phone's darwin partition, and nowhere else, from Android or TWRP (adb, root).
 
 usage:
   darwin-write.py check                 darwin's identity, read from the phone now                (writes nothing)
@@ -7,6 +7,8 @@ usage:
   darwin-write.py plan  IMAGE BLOCK     every check `write` makes, and the command it would run    (writes nothing)
   darwin-write.py write IMAGE BLOCK     with DARWIN_WRITE=yes: IMAGE at darwin's block BLOCK, read back and compared
   darwin-write.py zero  BLOCK COUNT     with DARWIN_WRITE=yes: zeros over COUNT blocks, read back and compared
+  darwin-write.py volume IMAGE          with DARWIN_INSTALL=yes: the iOS volume itself at block 0, once, when the
+                                        port is set up (IMAGE exactly the volume's size); read back and compared
   darwin-write.py selftest              the refusals, against this tool's own checks and a GPT read now (writes nothing)
 
 Blocks are darwin's own, 4096 bytes, counted from the partition's start. What it takes to write:
@@ -23,6 +25,9 @@ Blocks are darwin's own, 4096 bytes, counted from the partition's start. What it
     the name is checked again to be sda34 of darwin's size. Never /dev/block/sda or anything else.
   - afterwards the blocks are read back and their sha256 has to be the image's.
 
+Each phone's darwin is its own (XL_DEVICE=redwood, the default, or y2q): which entry of the GPT, where, and its
+unique GUID, in DEVICES below. A root shell (TWRP's) is used as it is; Android's is reached through su.
+
 Every attempt, refused or done, goes into logs/darwin-write.log.
 """
 import binascii
@@ -36,17 +41,28 @@ import uuid
 
 NAME = 'darwin'
 TYPE = '7C3457EF-0000-11AA-AA11-00306543ECAC'          # Apple APFS
-UNIQUE = 'FD6854AD-24AA-4FC3-94FE-290116858D68'
 LUN = 0
-PARTN = 34
-FIRST = 25374720
-LAST = 30617594
 BS = 4096
-BLOCKS = LAST - FIRST + 1                               # 5242875
-PROTECTED = 1374208                                     # rootfs.apfs: 5628755968 bytes, never written
+PROTECTED = 1374208                                     # rootfs.apfs: 5628755968 bytes, never written (but by `volume`)
 DEV = '/dev/block/by-name/darwin'
-NODE = '/dev/block/sda34'
-TMP = '/data/local/tmp/darwin-write.img'
+# each phone's darwin: entry of LUN 0's GPT, first and last LBA, unique GUID, where an image waits on the phone
+DEVICES = {
+    'redwood': dict(partn=34, first=25374720, last=30617594, unique='FD6854AD-24AA-4FC3-94FE-290116858D68',
+                    tmp='/data/local/tmp/darwin-write.img'),
+    # Galaxy S20+: sda38, 128 GiB made out of userdata's end (y2q-dump/pre-repartition); TWRP has /data, not /data/local
+    'y2q': dict(partn=38, first=28904192, last=62458874, unique='ED95D4DA-C7DC-4D4A-A874-6AC0978EB385',
+                tmp='/data/darwin-write.img'),
+}
+DEVICE = os.environ.get('XL_DEVICE') or 'redwood'
+if DEVICE not in DEVICES:
+    sys.exit('darwin-write: no darwin known for XL_DEVICE=%s (%s)' % (DEVICE, ', '.join(DEVICES)))
+PARTN = DEVICES[DEVICE]['partn']
+FIRST = DEVICES[DEVICE]['first']
+LAST = DEVICES[DEVICE]['last']
+UNIQUE = DEVICES[DEVICE]['unique']
+TMP = DEVICES[DEVICE]['tmp']
+BLOCKS = LAST - FIRST + 1                               # redwood 5242875, y2q 33554683
+NODE = '/dev/block/sda%d' % PARTN
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG = os.path.join(ROOT, 'logs', 'darwin-write.log')
@@ -63,16 +79,29 @@ def log(line):
     print('darwin-write: ' + line)
 
 
+_root_shell = None
+
+
+def root_shell():
+    """'sh' where adb's shell is root already (TWRP), 'su -c sh' where it is not (Android)."""
+    global _root_shell
+    if _root_shell is None:
+        r = subprocess.run(['adb', 'shell', 'id -u'], capture_output=True, text=True, timeout=60)
+        _root_shell = 'sh' if r.stdout.strip() == '0' else 'su -c sh'
+    return _root_shell
+
+
 def phone(script, binary=False):
     """Run a script in the phone's root shell (on its standard input, as flash-fingerprint.sh does)."""
-    r = subprocess.run(['adb', 'shell', 'su -c sh'], input=script.encode(), capture_output=True, timeout=3600)
+    r = subprocess.run(['adb', 'shell', root_shell()], input=script.encode(), capture_output=True, timeout=3600)
     if r.returncode != 0:
         raise Refused('the phone said %d: %s' % (r.returncode, (r.stdout + r.stderr).decode(errors='replace')[-400:]))
     return r.stdout if binary else r.stdout.decode(errors='replace')
 
 
 def phone_bytes(command):
-    r = subprocess.run(['adb', 'exec-out', 'su -c "%s"' % command], capture_output=True, timeout=600)
+    wrapped = command if root_shell() == 'sh' else 'su -c "%s"' % command
+    r = subprocess.run(['adb', 'exec-out', wrapped], capture_output=True, timeout=600)
     if r.returncode != 0:
         raise Refused('reading from the phone: exit %d' % r.returncode)
     return r.stdout
@@ -251,6 +280,36 @@ def cmd_plan(image, block, write=False):
         phone('rm -f %s\n' % TMP)
 
 
+def cmd_volume(image):
+    """The iOS volume at block 0: the one write into it, made once when the port is set up."""
+    size = os.path.getsize(image)
+    if size != PROTECTED * BS:
+        raise Refused('%s is %d bytes, not the iOS volume\'s %d' % (image, size, PROTECTED * BS))
+    who = identity()
+    digest = sha256_file(image)
+    dd = 'dd if=%s of=%s bs=%d seek=0 count=%d conv=notrunc,fsync' % (TMP, DEV, BS, PROTECTED)
+    log('volume: %s (%d blocks, sha256 %s) at darwin blocks 0..%d; %s; runs: %s' % (image, PROTECTED, digest,
+                                                                                  PROTECTED - 1, who, dd))
+    if os.environ.get('DARWIN_INSTALL') != 'yes':
+        raise Refused('DARWIN_INSTALL=yes is not set: nothing written')
+    r = subprocess.run(['adb', 'push', image, TMP], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Refused('adb push: ' + r.stderr.strip())
+    try:
+        there = phone('sha256sum %s\n' % TMP).split()[0]
+        if there != digest:
+            raise Refused('the copy on the phone has sha256 %s, not %s' % (there, digest))
+        identity()                                   # once more, right before the write
+        out = phone(guarded(dd))
+        log('dd: ' + ' '.join(out.split()))
+        back = phone_sum(0, PROTECTED)
+        log('read back blocks 0..%d: sha256 %s -- %s' % (PROTECTED - 1, back, 'the same' if back == digest else 'DIFFERENT'))
+        if back != digest:
+            raise Refused('what was read back is not what was written')
+    finally:
+        phone('rm -f %s\n' % TMP)
+
+
 def cmd_zero(block, count):
     blocks_ok(block, count)
     who = identity()
@@ -333,6 +392,8 @@ def main():
             cmd_plan(a[1], number(a[2]), write=(a[0] == 'write'))
         elif len(a) == 3 and a[0] == 'zero':
             cmd_zero(number(a[1]), number(a[2]))
+        elif len(a) == 2 and a[0] == 'volume':
+            cmd_volume(a[1])
         elif a == ['selftest']:
             sys.exit(0 if cmd_selftest() else 1)
         else:

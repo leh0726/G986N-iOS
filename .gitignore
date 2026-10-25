@@ -1,6 +1,10 @@
 # A whitelist: the working tree also holds gigabytes of downloads, build output, logs, third-party
-# clones, files of iOS and the hackios-xnu-userland checkout (common/setup.sh), none of which belongs
-# in this repository. Nothing is tracked unless it is named here.
+# clones and files of iOS, none of which belongs in this repository (common/bootstrap.sh fetches or
+# builds all of it again). Nothing is tracked unless it is named here.
+#
+# G986N-iOS carries both of HackiOS's repositories in one: hackios-xnu-kernel's files and
+# hackios-xnu-userland's (userland/, ios165/'s scripts, the userland's tools, docs and prebuilt/userland),
+# with their histories merged, and the Galaxy S20+ (y2q) port on top.
 /*
 !/.gitignore
 !/README.md
@@ -19,25 +23,29 @@
 !/uefi/
 !/prebuilt/
 !/wifi/
+!/userland/
+!/ios165/
 
 __pycache__/
 *~
 *.orig
 *.rej
+*.part
 
-# hackios-xnu-userland's files share this working tree (common/setup.sh)
-/docs/air.md
-/docs/air-report.md
-/prebuilt/userland/
-/tools/apfs/
-/tools/air/
-/tools/mesa/
-/tools/metal/
-/tools/mk-mesa.sh
-/tools/mk-jb.sh
-/tools/jb-preinstall.py
-/tools/font_trim.py
-/tools/metallib.py
+# of the userland only the sources (userland/build.sh builds the rest; userland/obj, the images)
+/userland/*
+!/userland/build.sh
+!/userland/*.py
+!/userland/rc.*
+!/userland/com.redwood.*.plist
+!/userland/src/
+!/userland/libmini/
+!/userland/var/
+
+# of ios165 only the scripts (ios165/fetch.sh takes iOS out of Apple's IPSW onto this machine)
+/ios165/*
+!/ios165/fetch.sh
+!/ios165/*.py
 
 /xnuloader/*
 !/xnuloader/build.sh
@@ -80,3 +88,4 @@ __pycache__/
 !/xnu-deps/build/lzbitmap/libzbitmap.c
 !/xnu-deps/build/lzbitmap/libzbitmap.h
 /tools/android/f2fs-resize
+

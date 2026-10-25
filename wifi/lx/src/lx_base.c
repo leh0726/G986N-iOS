@@ -14,6 +14,7 @@
 #include <sys/systm.h>
 #include <sys/callout.h>
 #include <sys/kdb.h>
+#include <sys/linker.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
 #include <sys/pcpu.h>
@@ -25,6 +26,7 @@
 
 #include <linux/bottom_half.h>
 #include <linux/completion.h>
+#include <linux/debugfs.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmi.h>
 #include <linux/firmware.h>
@@ -47,6 +49,62 @@
 
 /* ---- saying things ------------------------------------------------------------------------- */
 
+/*
+ * vsnprintf() with Linux's %pV as well: a format and its arguments of their own (struct va_format),
+ * which brcmfmac's messages are made of ("%s: %pV"). Before a %pV only %s and %% are understood; a
+ * format with anything else there is left to vsnprintf() as it is.
+ */
+static void
+lx_vformat(char *line, size_t size, const char *format, va_list list)
+{
+	const char *pv = format, *f;
+	size_t at = 0;
+
+	while (*pv != '\0' && !(pv[0] == '%' && pv[1] == 'p' && pv[2] == 'V')) {
+		pv++;
+	}
+	if (*pv == '\0') {
+		vsnprintf(line, size, format, list);
+		return;
+	}
+	for (f = format; f < pv; f++) {
+		if (*f == '%' && f[1] != '%' && f[1] != 's') {
+			vsnprintf(line, size, format, list);
+			return;
+		}
+		if (*f == '%') {
+			f++;
+		}
+	}
+	line[0] = '\0';
+	for (f = format; *f != '\0' && at + 1 < size; f++) {
+		if (f[0] == '%' && f[1] == '%') {
+			line[at++] = '%';
+			f++;
+		} else if (f[0] == '%' && f[1] == 's') {
+			const char *text = va_arg(list, const char *);
+
+			at += strlcpy(line + at, text != NULL ? text : "(null)", size - at);
+			f++;
+		} else if (f[0] == '%' && f[1] == 'p' && f[2] == 'V') {
+			struct va_format *vaf = va_arg(list, struct va_format *);
+			va_list inner;
+
+			va_copy(inner, *vaf->va);
+			vsnprintf(line + at, size - at, vaf->fmt, inner);
+			va_end(inner);
+			at += strlen(line + at);
+			f += 2;
+		} else {
+			line[at++] = *f;
+		}
+		if (at >= size) {
+			at = size - 1;
+		}
+	}
+	line[at] = '\0';
+}
+
 int
 printf(const char *format, ...)
 {
@@ -54,7 +112,7 @@ printf(const char *format, ...)
 	va_list list;
 
 	va_start(list, format);
-	vsnprintf(line, sizeof(line), format, list);
+	lx_vformat(line, sizeof(line), format, list);
 	va_end(list);
 	lx_os_print(line);
 	return (0);
@@ -68,7 +126,7 @@ lx_tell(const char *format, ...)
 	va_list list;
 
 	va_start(list, format);
-	vsnprintf(line, sizeof(line), format, list);
+	lx_vformat(line, sizeof(line), format, list);
 	va_end(list);
 	lx_os_tell(line);
 }
@@ -747,24 +805,89 @@ iounmap(void *address)
 }
 
 /*
+ * Copies to and from device memory: the device's side touched in aligned words of four bytes, and
+ * bytes one at a time where it is not aligned (device memory takes no unaligned or wider access).
+ */
+void
+lx_memcpy_toio(volatile void *to, const void *from, size_t length)
+{
+	volatile uint8_t *d = to;
+	const uint8_t *s = from;
+
+	for (; length > 0 && ((uintptr_t)d & 3) != 0; length--) {
+		*d++ = *s++;
+	}
+	for (; length >= 4; length -= 4, d += 4, s += 4) {
+		uint32_t word;
+
+		memcpy(&word, s, 4);
+		*(volatile uint32_t *)d = word;
+	}
+	for (; length > 0; length--) {
+		*d++ = *s++;
+	}
+}
+
+void
+lx_memcpy_fromio(void *to, const volatile void *from, size_t length)
+{
+	uint8_t *d = to;
+	const volatile uint8_t *s = from;
+
+	for (; length > 0 && ((uintptr_t)s & 3) != 0; length--) {
+		*d++ = *s++;
+	}
+	for (; length >= 4; length -= 4, d += 4, s += 4) {
+		uint32_t word = *(const volatile uint32_t *)s;
+
+		memcpy(d, &word, 4);
+	}
+	for (; length > 0; length--) {
+		*d++ = *s++;
+	}
+}
+
+void
+lx_memset_io(volatile void *to, int value, size_t length)
+{
+	volatile uint8_t *d = to;
+	uint32_t word = (uint8_t)value * 0x01010101u;
+
+	for (; length > 0 && ((uintptr_t)d & 3) != 0; length--) {
+		*d++ = (uint8_t)value;
+	}
+	for (; length >= 4; length -= 4, d += 4) {
+		*(volatile uint32_t *)d = word;
+	}
+	for (; length > 0; length--) {
+		*d++ = (uint8_t)value;
+	}
+}
+
+/*
  * Memory the radio itself reads and writes: its rings, and the buffers it fills. The radio
  * reaches memory through the SoC's SMMU, which lets it see what it has been shown and nothing
  * else; so all such memory comes out of one piece, taken once, which the kernel's side shows
  * the radio and says the radio's address of (lx_os_radio_memory()). That piece is not behind
  * the processor's cache: there is nothing to do between our writing and the radio's reading,
  * or the other way round. The first part of it is handed out for good, a stretch at a time
- * (rings); the rest is slots of one size, taken and given back (buffers).
+ * (rings); the rest is slots, taken and given back (buffers): a few big ones (brcmfmac's buffers
+ * for the firmware's answers are 8 KB), then many of one page.
  */
 #define POOL_SIZE	(44u << 20)
 #define POOL_RINGS	(12u << 20)		/* (the data path's rings and link descriptors come to about 6 MB) */
+#define POOL_BIG	16384u
+#define POOL_BIGS	64u
+#define POOL_SMALL	(POOL_RINGS + POOL_BIG * POOL_BIGS)	/* where the slots of a page begin */
 #define POOL_SLOT	4096u
-#define POOL_SLOTS	((POOL_SIZE - POOL_RINGS) / POOL_SLOT)
+#define POOL_SLOTS	((POOL_SIZE - POOL_SMALL) / POOL_SLOT)
 
 static struct {
 	uint8_t *memory;
 	unsigned long long address;		/* the radio's, of the first byte */
 	uint32_t rings_used;
 	uint32_t free_slots[POOL_SLOTS], free_count;
+	uint32_t free_bigs[POOL_BIGS], free_big_count;
 } pool;
 
 int
@@ -781,6 +904,10 @@ lx_pool_init(void)
 		pool.free_slots[i] = POOL_SLOTS - 1 - i;
 	}
 	pool.free_count = POOL_SLOTS;
+	for (uint32_t i = 0; i < POOL_BIGS; i++) {
+		pool.free_bigs[i] = POOL_BIGS - 1 - i;
+	}
+	pool.free_big_count = POOL_BIGS;
 	printf("lx: %u MB for the radio to read and write; it knows them from %#llx on\n", POOL_SIZE >> 20, pool.address);
 	return (0);
 }
@@ -873,11 +1000,12 @@ linuxkpi_dev_alloc_skb(size_t size, gfp_t gfp)
 {
 	size_t all = roundup2(sizeof(struct sk_buff), 64) + sizeof(struct skb_shared_info) + 64;
 	struct sk_buff *skb;
-	uint8_t *raw;
+	bool big = size + NET_SKB_PAD > POOL_SLOT;
+	uint8_t *raw, *data;
 	uint32_t slot;
 
-	if (size + NET_SKB_PAD > POOL_SLOT) {
-		printf("lx: a buffer of %zu bytes is asked for; the slots are %u\n", size, POOL_SLOT);
+	if (size + NET_SKB_PAD > POOL_BIG) {
+		printf("lx: a buffer of %zu bytes is asked for; the biggest slots are %u\n", size, POOL_BIG);
 		return (NULL);
 	}
 	raw = lkpi_kmalloc(all, gfp);
@@ -885,20 +1013,26 @@ linuxkpi_dev_alloc_skb(size_t size, gfp_t gfp)
 		return (NULL);
 	}
 	lx_os_lock();
-	if (pool.free_count == 0) {
+	if ((big ? pool.free_big_count : pool.free_count) == 0) {
 		lx_os_unlock();
 		lkpi_kfree(raw);
-		printf("lx: no buffer left\n");
+		printf("lx: no %s buffer left\n", big ? "big" : "small");
 		return (NULL);
 	}
-	slot = pool.free_slots[--pool.free_count];
+	if (big) {
+		slot = pool.free_bigs[--pool.free_big_count];
+		data = pool.memory + POOL_RINGS + (size_t)slot * POOL_BIG;
+	} else {
+		slot = pool.free_slots[--pool.free_count];
+		data = pool.memory + POOL_SMALL + (size_t)slot * POOL_SLOT;
+	}
 	lx_os_unlock();
 	skb = (struct sk_buff *)roundup2((uintptr_t)raw, 64);
 	skb->m = raw;				/* (the field FreeBSD keeps for what is behind a buffer) */
-	skb->prev = skb->next = skb;
+	skb->prev = skb->next = NULL;			/* (on no list: brcmutil warns of a buffer freed with a next) */
 	skb->shinfo = (struct skb_shared_info *)((uint8_t *)skb + roundup2(sizeof(struct sk_buff), 64));
 	skb->truesize = size + NET_SKB_PAD;
-	skb->head = skb->data = pool.memory + POOL_RINGS + (size_t)slot * POOL_SLOT;
+	skb->head = skb->data = data;
 	skb_reset_tail_pointer(skb);
 	skb->end = skb->head + size + NET_SKB_PAD;
 	skb_reserve(skb, NET_SKB_PAD);
@@ -911,9 +1045,13 @@ linuxkpi_kfree_skb(struct sk_buff *skb)
 	if (skb == NULL) {
 		return;
 	}
-	if (in_pool(skb->head, 1) && skb->head >= pool.memory + POOL_RINGS) {
+	if (in_pool(skb->head, 1) && skb->head >= pool.memory + POOL_SMALL) {
 		lx_os_lock();
-		pool.free_slots[pool.free_count++] = (uint32_t)((skb->head - (pool.memory + POOL_RINGS)) / POOL_SLOT);
+		pool.free_slots[pool.free_count++] = (uint32_t)((skb->head - (pool.memory + POOL_SMALL)) / POOL_SLOT);
+		lx_os_unlock();
+	} else if (in_pool(skb->head, 1) && skb->head >= pool.memory + POOL_RINGS) {
+		lx_os_lock();
+		pool.free_bigs[pool.free_big_count++] = (uint32_t)((skb->head - (pool.memory + POOL_RINGS)) / POOL_BIG);
 		lx_os_unlock();
 	}
 	lkpi_kfree(skb->m);
@@ -930,6 +1068,7 @@ linuxkpi_firmware_request_nowarn(const struct linuxkpi_firmware **out, const cha
 	int error = lx_os_firmware(name, &data, &size);
 
 	printf("lx: the driver asks for the file \"%s\": %s\n", name, error == 0 ? "there" : "not there");
+	*out = NULL;					/* (as Linux leaves it: brcmfmac asks for several files into one variable) */
 	if (error != 0) {
 		return (-ENOENT);
 	}
@@ -947,6 +1086,366 @@ void
 linuxkpi_release_firmware(const struct linuxkpi_firmware *fw)
 {
 	lkpi_kfree(fw);
+}
+
+int
+linuxkpi_request_firmware(const struct linuxkpi_firmware **out, const char *name, struct device *dev)
+{
+	return (linuxkpi_firmware_request_nowarn(out, name, dev));
+}
+
+/*
+ * A file asked for in the background, as Linux does it: the answer goes to `cont` on a thread of its
+ * own, which ends with it (brcmfmac does the whole of its setup there).
+ */
+struct lx_firmware_later {
+	char name[96];
+	struct device *dev;
+	void *context;
+	void (*cont)(const struct linuxkpi_firmware *, void *);
+};
+
+static void
+firmware_later(void *argument)
+{
+	struct lx_firmware_later later = *(struct lx_firmware_later *)argument;
+	const struct linuxkpi_firmware *fw = NULL;
+
+	lkpi_kfree(argument);
+	if (linuxkpi_firmware_request_nowarn(&fw, later.name, later.dev) != 0) {
+		fw = NULL;
+	}
+	later.cont(fw, later.context);
+}
+
+int
+linuxkpi_request_firmware_nowait(struct module *module, bool uevent, const char *name, struct device *dev, gfp_t gfp,
+    void *context, void (*cont)(const struct linuxkpi_firmware *, void *))
+{
+	struct lx_firmware_later *later = lkpi_kmalloc(sizeof(*later), GFP_KERNEL);
+
+	if (later == NULL) {
+		return (-ENOMEM);
+	}
+	strlcpy(later->name, name, sizeof(later->name));
+	later->dev = dev;
+	later->context = context;
+	later->cont = cont;
+	if (lx_os_thread("wifi-firmware", firmware_later, later) != 0) {
+		lkpi_kfree(later);
+		return (-EAGAIN);
+	}
+	return (0);
+}
+
+/* ---- the C library and FreeBSD's kernel, as far as LinuxKPI's inline code reaches them ------------------ */
+
+int cold;					/* (the kernel is up: sleeping is allowed) */
+linker_file_t __this_linker_file;		/* (THIS_MODULE: nobody looks inside) */
+struct malloc_type M_KMALLOC[1];
+
+#undef malloc					/* (sys/malloc.h's macro around the function) */
+void *
+malloc(size_t size, struct malloc_type *type, int flags)
+{
+	void *memory = lkpi_kmalloc(size, 0);
+
+	if (memory != NULL && (flags & M_ZERO)) {
+		bzero(memory, size);
+	}
+	return (memory);
+}
+
+void
+free(void *memory, struct malloc_type *type)
+{
+	lkpi_kfree(memory);
+}
+
+void
+panic(const char *format, ...)
+{
+	char line[400];
+	va_list list;
+
+	va_start(list, format);
+	lx_vformat(line, sizeof(line), format, list);
+	va_end(list);
+	lx_os_panic(line);
+}
+
+/* Busy: for the few microseconds a register needs. */
+void
+DELAY(int usec)
+{
+	unsigned long long until = lx_os_nanoseconds() + (unsigned long long)(usec > 0 ? usec : 0) * 1000ull;
+
+	while (lx_os_nanoseconds() < until) {
+	}
+}
+
+/* msleep(), usleep_range() and their kin: a time in seconds with 32 bits of fraction. */
+int
+pause_sbt(const char *wmesg, sbintime_t sbt, sbintime_t pr, int flags)
+{
+	static char nothing;
+	unsigned long long ns = sbt <= 0 ? 0 : (unsigned long long)(((__uint128_t)sbt * 1000000000ull) >> 32);
+
+	if (ns < 50000) {
+		DELAY((int)(ns / 1000) + 1);
+		return (0);
+	}
+	lx_os_lock();
+	lx_os_sleep(&nothing, ns);
+	lx_os_unlock();
+	return (0);
+}
+
+void
+sched_relinquish(struct thread *td)
+{
+	lx_pause_ms(1);
+}
+
+void
+nanouptime(struct timespec *ts)
+{
+	unsigned long long ns = lx_os_nanoseconds();
+
+	ts->tv_sec = (time_t)(ns / 1000000000ull);
+	ts->tv_nsec = (long)(ns % 1000000000ull);
+}
+
+static char *
+vkasprintf(const char *format, va_list list)
+{
+	va_list again;
+	char *text;
+	int length;
+
+	va_copy(again, list);
+	length = vsnprintf(NULL, 0, format, again);
+	va_end(again);
+	text = lkpi_kmalloc((size_t)length + 1, 0);
+	if (text != NULL) {
+		vsnprintf(text, (size_t)length + 1, format, list);
+	}
+	return (text);
+}
+
+char *
+kasprintf(gfp_t gfp, const char *format, ...)
+{
+	va_list list;
+	char *text;
+
+	va_start(list, format);
+	text = vkasprintf(format, list);
+	va_end(list);
+	return (text);
+}
+
+/* (Not given back with the device: devices are made once here.) */
+char *
+lkpi_devm_kasprintf(struct device *dev, gfp_t gfp, const char *format, ...)
+{
+	va_list list;
+	char *text;
+
+	va_start(list, format);
+	text = vkasprintf(format, list);
+	va_end(list);
+	return (text);
+}
+
+/* dev_info(), dev_err() and the rest: the driver's own words, a line each. */
+int
+device_printf(device_t dev, const char *format, ...)
+{
+	char line[400];
+	va_list list;
+
+	va_start(list, format);
+	lx_vformat(line, sizeof(line), format, list);
+	va_end(list);
+	printf("lx: %s", line);
+	return (0);
+}
+
+size_t
+strnlen(const char *s, size_t max)
+{
+	size_t n = 0;
+
+	while (n < max && s[n] != '\0') {
+		n++;
+	}
+	return (n);
+}
+
+char *
+strchrnul(const char *s, int c)
+{
+	while (*s != '\0' && *s != (char)c) {
+		s++;
+	}
+	return ((char *)(uintptr_t)s);
+}
+
+char *
+strsep(char **string, const char *delimiters)
+{
+	char *begin = *string, *end;
+
+	if (begin == NULL) {
+		return (NULL);
+	}
+	for (end = begin; *end != '\0' && strchr(delimiters, *end) == NULL; end++) {
+	}
+	if (*end == '\0') {
+		*string = NULL;
+	} else {
+		*end = '\0';
+		*string = end + 1;
+	}
+	return (begin);
+}
+
+char *
+strnstr(const char *s, const char *find, size_t length)
+{
+	size_t n = strlen(find);
+
+	if (n == 0) {
+		return ((char *)(uintptr_t)s);
+	}
+	for (; length >= n && *s != '\0'; s++, length--) {
+		if (strncmp(s, find, n) == 0) {
+			return ((char *)(uintptr_t)s);
+		}
+	}
+	return (NULL);
+}
+
+u_long
+strtoul(const char *s, char **end, int base)
+{
+	u_long value = 0;
+
+	while (*s == ' ' || *s == '\t') {
+		s++;
+	}
+	if ((base == 0 || base == 16) && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+		s += 2;
+		base = 16;
+	} else if (base == 0) {
+		base = s[0] == '0' ? 8 : 10;
+	}
+	for (;; s++) {
+		int digit;
+
+		if (*s >= '0' && *s <= '9') {
+			digit = *s - '0';
+		} else if (*s >= 'a' && *s <= 'z') {
+			digit = *s - 'a' + 10;
+		} else if (*s >= 'A' && *s <= 'Z') {
+			digit = *s - 'A' + 10;
+		} else {
+			break;
+		}
+		if (digit >= base) {
+			break;
+		}
+		value = value * (u_long)base + (u_long)digit;
+	}
+	if (end != NULL) {
+		*end = (char *)(uintptr_t)s;
+	}
+	return (value);
+}
+
+/* There is no user space behind the driver: what it copies "in" is the kernel's already. */
+int
+linux_copyin(const void *from, void *to, size_t length)
+{
+	memcpy(to, from, length);
+	return (0);
+}
+
+/* DEFINE_MUTEX(): FreeBSD runs this at boot from a linker set; a lock of all zeroes is free here anyway. */
+void
+sx_sysinit(const void *arg)
+{
+	const struct sx_args *args = arg;
+
+	sx_init_flags(args->sa_sx, args->sa_desc, args->sa_flags);
+}
+
+void
+sx_destroy(struct sx *sx)
+{
+}
+
+void
+add_timer(struct timer_list *timer)
+{
+	mod_timer(timer, timer->expires);
+}
+
+int linuxkpi_debug;				/* LinuxKPI's pr_debug() of a driver built with DEBUG: said when set */
+
+int
+__lkpi_hexdump_printf(void *arg, const char *format, ...)
+{
+	char line[400];
+	va_list list;
+
+	va_start(list, format);
+	lx_vformat(line, sizeof(line), format, list);
+	va_end(list);
+	lx_os_print(line);
+	return (0);
+}
+
+/* print_hex_dump(): rows of bytes in hexadecimal (groups, the offset in front and the text behind are left out). */
+void
+lkpi_hex_dump(int (*say)(void *, const char *, ...), void *arg1, const char *level, const char *prefix, const int prefix_type,
+    const int rowsize, const int groupsize, const void *buffer, size_t length, const bool ascii, const bool trailing)
+{
+	const uint8_t *bytes = buffer;
+	int row = rowsize == 32 ? 32 : 16;
+
+	for (size_t at = 0; at < length; at += row) {
+		char line[3 * 32 + 1];
+		size_t n = length - at < (size_t)row ? length - at : (size_t)row;
+
+		for (size_t i = 0; i < n; i++) {
+			snprintf(line + 3 * i, 4, "%02x ", bytes[at + i]);
+		}
+		line[3 * n] = '\0';
+		say(arg1, "%s%s\n", prefix != NULL ? prefix : "", line);
+	}
+}
+
+int
+timer_shutdown_sync(struct timer_list *timer)
+{
+	return (timer_delete_sync(timer));
+}
+
+/* (Asked before a wake-up that is otherwise left out: waking costs nothing here.) */
+bool
+linux_waitqueue_active(wait_queue_head_t *wqh)
+{
+	return (true);
+}
+
+struct workqueue_struct *system_wq, *system_long_wq, *system_unbound_wq, *system_highpri_wq;
+
+struct dentry *
+debugfs_create_file(const char *name, umode_t mode, struct dentry *parent, void *data, const struct file_operations *fops)
+{
+	return (NULL);
 }
 
 /* ---- what the files built so far name and do not get to --------------------------------------------- */
@@ -1197,7 +1696,7 @@ log(int level, const char *format, ...)
 	va_list list;
 
 	va_start(list, format);
-	vsnprintf(line, sizeof(line), format, list);
+	lx_vformat(line, sizeof(line), format, list);
 	va_end(list);
 	lx_os_print(line);
 }
@@ -1218,8 +1717,9 @@ linux_dmi_first_match(const struct dmi_system_id *list)
 void
 lx_memory_say(void)
 {
-	lx_tell("lx: memory: %ld pieces of the kernel's out, %ld KB; of the radio's %u MB: %u KB of rings, %u of %u buffers out\n",
-	    allocations, allocated >> 10, POOL_SIZE >> 20, pool.rings_used >> 10, POOL_SLOTS - pool.free_count, POOL_SLOTS);
+	lx_tell("lx: memory: %ld pieces of the kernel's out, %ld KB; of the radio's %u MB: %u KB of rings, %u of %u buffers "
+	    "and %u of %u big ones out\n", allocations, allocated >> 10, POOL_SIZE >> 20, pool.rings_used >> 10,
+	    POOL_SLOTS - pool.free_count, POOL_SLOTS, POOL_BIGS - pool.free_big_count, POOL_BIGS);
 }
 
 int
@@ -1231,5 +1731,9 @@ lx_base_init(void)
 		return (0);
 	}
 	begun = true;
+	system_wq = system_long_wq = system_unbound_wq = system_highpri_wq = linux_create_workqueue_common("wifi-events", 1);
+	if (system_wq == NULL) {
+		return (ENOMEM);
+	}
 	return (lx_os_thread("wifi-ticks", ticker, NULL));
 }

@@ -1,0 +1,92 @@
+--- a/brcmfmac/pcie.c	2026-10-25 10:26:13.092822605 +0900
++++ b/brcmfmac/pcie.c	2026-10-25 10:26:13.106837845 +0900
+@@ -237,6 +237,20 @@
+ #define BRCMF_SHARED_DMA_SCRATCH_ADDR_OFFSET	56
+ #define BRCMF_SHARED_DMA_RINGUPD_LEN_OFFSET	64
+ #define BRCMF_SHARED_DMA_RINGUPD_ADDR_OFFSET	68
++/* the same place from version 6 on, as Broadcom's bcmdhd has the shared area
++ * (pciedev_shared_t): memory of the host's for the firmware's station records
++ * ("host SCB", flags2 HSCB), the size the firmware asks for and the host's
++ * capabilities
++ */
++#define BRCMF_SHARED_HOST_SCB_ADDR_OFFSET	64
++#define BRCMF_SHARED_HOST_SCB_SIZE_OFFSET	72
++#define BRCMF_SHARED_FLAGS2_OFFSET		80
++#define BRCMF_SHARED_HOST_CAP_OFFSET		84
++#define BRCMF_PCIE_SHARED2_HSCB			0x00000800
++#define BRCMF_HOSTCAP_H2D_ENABLE_HOSTRDY	0x00000400
++#define BRCMF_HOSTCAP_DS_NO_OOB_DW		0x00001000
++#define BRCMF_HOSTCAP_UR_FW_NO_TRAP		0x00800000
++#define BRCMF_HOSTCAP_HSCB			0x02000000
+ 
+ #define BRCMF_RING_H2D_RING_COUNT_OFFSET	0
+ #define BRCMF_RING_D2H_RING_COUNT_OFFSET	1
+@@ -316,6 +330,9 @@
+ 	dma_addr_t scratch_dmahandle;
+ 	void *ringupd;
+ 	dma_addr_t ringupd_dmahandle;
++	void *host_scb;
++	dma_addr_t host_scb_dmahandle;
++	u32 host_scb_size;
+ 	u8 version;
+ };
+ 
+@@ -1390,6 +1407,11 @@
+ 				  BRCMF_DMA_D2H_SCRATCH_BUF_LEN,
+ 				  devinfo->shared.scratch,
+ 				  devinfo->shared.scratch_dmahandle);
++	if (devinfo->shared.host_scb)
++		dma_free_coherent(&devinfo->pdev->dev,
++				  devinfo->shared.host_scb_size,
++				  devinfo->shared.host_scb,
++				  devinfo->shared.host_scb_dmahandle);
+ 	if (devinfo->shared.ringupd)
+ 		dma_free_coherent(&devinfo->pdev->dev,
+ 				  BRCMF_DMA_D2H_RINGUPD_BUF_LEN,
+@@ -1428,6 +1450,46 @@
+ 	if (!devinfo->shared.ringupd)
+ 		goto fail;
+ 
++	/* The BCM4375's firmware has the shared area of version 6 and later
++	 * there: no ring update buffer (it keeps the indices itself), but the
++	 * host SCB memory it asks for, and the host's capabilities, as bcmdhd
++	 * gives them. Without, it drops every data frame from the network.
++	 */
++	if (devinfo->ci->chip == BRCM_CC_4375_CHIP_ID) {
++		u32 flags2, size, cap;
++
++		addr = devinfo->shared.tcm_base_address;
++		flags2 = brcmf_pcie_read_tcm32(devinfo,
++					       addr + BRCMF_SHARED_FLAGS2_OFFSET);
++		size = brcmf_pcie_read_tcm32(devinfo,
++					     addr + BRCMF_SHARED_HOST_SCB_SIZE_OFFSET);
++		cap = BRCMF_PCIE_SHARED_VERSION_7 |
++		      BRCMF_HOSTCAP_H2D_ENABLE_HOSTRDY |
++		      BRCMF_HOSTCAP_DS_NO_OOB_DW | BRCMF_HOSTCAP_UR_FW_NO_TRAP;
++		if ((flags2 & BRCMF_PCIE_SHARED2_HSCB) && size) {
++			devinfo->shared.host_scb =
++				dma_alloc_coherent(&devinfo->pdev->dev, size,
++					&devinfo->shared.host_scb_dmahandle,
++					GFP_KERNEL);
++			if (!devinfo->shared.host_scb)
++				goto fail;
++			devinfo->shared.host_scb_size = size;
++			address = (u64)devinfo->shared.host_scb_dmahandle;
++			brcmf_pcie_write_tcm32(devinfo,
++				addr + BRCMF_SHARED_HOST_SCB_ADDR_OFFSET,
++				address & 0xffffffff);
++			brcmf_pcie_write_tcm32(devinfo,
++				addr + BRCMF_SHARED_HOST_SCB_ADDR_OFFSET + 4,
++				address >> 32);
++			cap |= BRCMF_HOSTCAP_HSCB;
++		}
++		brcmf_pcie_write_tcm32(devinfo,
++				       addr + BRCMF_SHARED_HOST_CAP_OFFSET, cap);
++		brcmf_err(bus, "BCM4375: flags2 %#x, host scb %u bytes, host_cap %#x\n",
++			  flags2, size, cap);
++		return 0;
++	}
++
+ 	addr = devinfo->shared.tcm_base_address +
+ 	       BRCMF_SHARED_DMA_RINGUPD_ADDR_OFFSET;
+ 	address = (u64)devinfo->shared.ringupd_dmahandle;

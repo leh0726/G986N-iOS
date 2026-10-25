@@ -58,6 +58,7 @@ extern void redwood_camera_quiesce(void);
 extern void redwood_mic_quiesce(void);
 extern void redwood_ufs_quiesce(void);
 extern void redwood_var_save_on_return(void);   /* bsd/dev/redwood_ufs.c: the data volume into the flash */
+extern void MiniIOMobileFramebufferQuiesce(void);       /* iokit/Kernel/MiniIOMobileFramebuffer.cpp */
 void loader_checkpoint(uint64_t n);
 
 /* Also referenced from the early exception vector in start.s. */
@@ -198,7 +199,9 @@ struct loader_live {
 	volatile uint64_t stop;         /* the loader's to write: the host has asked for the run to end */
 	uint64_t magic2;                /* "XNULIVE2": what follows is there (a loader may meet an older kernel) */
 	const uint64_t *sound;          /* loader_sound: the same for a recording of the sound */
+	volatile uint64_t power;        /* LOADER_POWER_TAG | 1 off, 2 restart: how the system ended (loader_return_power()) */
 };
+#define LOADER_POWER_TAG        0x52574f5000000000ULL   /* the loader takes the low byte only with this above it */
 
 /*
  * A screen recording (the display driver makes one with boot-arg rec_secs): where it is, for the
@@ -214,6 +217,16 @@ struct loader_live loader_live = {
 	.recording = loader_recording,
 	.magic2 = 0x324556494c554e58ULL, .sound = loader_sound,
 };
+
+/*
+ * How the system ended, for a loader that runs it without the computer: iOS turned off (the phone is
+ * to be powered off) or restarted. Said just before the way back to the loader.
+ */
+void
+loader_return_power(bool restart)
+{
+	loader_live.power = LOADER_POWER_TAG | (restart ? 2 : 1);
+}
 
 /* Valid from the first instruction of C code: does not depend on gVirtBase/gPhysBase being set up. */
 static inline uint64_t
@@ -378,6 +391,7 @@ loader_return(void)
 	redwood_torch_quiesce();        /* the flashlight off, if it was lit */
 	redwood_camera_quiesce();       /* the camera powered down, if it was powered up */
 	redwood_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
+	MiniIOMobileFramebufferQuiesce();       /* the panel back on the firmware's buffer, the one the loader draws on */
 	/*
 	 * A panic's text is first collected in the panic buffer and only later
 	 * flushed to the console; if the console itself is what failed, that

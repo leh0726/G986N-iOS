@@ -774,7 +774,10 @@ extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, uint32_t field, CFInd
 static struct {
 	bool touching, edge;
 	double x, y;
+	uint32_t identity;      /* this touch's own, new at every landing, as Apple's touch controller numbers them */
 } fingers[MAX_FINGERS];
+static uint32_t next_identity = 2;
+
 
 static CFNumberRef
 number(int value)
@@ -909,6 +912,15 @@ make_service(IOHIDEventSystemClientRef client, const char *product, int page, in
 	CFDictionarySetValue(properties, CFSTR("ProductID"), zero);
 	if (display) {
 		CFDictionarySetValue(properties, CFSTR("DisplayIntegrated"), kCFBooleanTrue);
+		/*
+		 * Asked for at the first touch: the iPhone X's user space scales a finger's pressure by
+		 * it into the touch's force. Our pressure is always 0, so any maximum makes that force 0.
+		 */
+		CFNumberRef most = number(1000);
+
+		CFDictionarySetValue(properties, CFSTR("AccurateMaxDigitizerPressureValue"), most);
+		CFDictionarySetValue(properties, CFSTR("MaxDigitizerPressureValue"), most);
+		CFRelease(most);
 	}
 	/* the dictionary stays: it is what service_copy_property() answers from */
 	made->properties = properties;
@@ -948,6 +960,10 @@ send_touch(IOHIDServiceClientRef screen, const struct redwood_touch *t)
 	fingers[f].x = t->x / 65535.0;
 	fingers[f].y = t->y / 65535.0;
 	if (t->type == REDWOOD_TOUCH_DOWN) {
+		fingers[f].identity = next_identity++;
+		if (next_identity > 0xfff0) {
+			next_identity = 2;
+		}
 		fingers[f].edge = fingers[f].x < EDGE_SIDE || fingers[f].x > 1 - EDGE_SIDE || fingers[f].y < EDGE_TOP ||
 		    fingers[f].y > 1 - EDGE_BOTTOM;
 	}
@@ -963,9 +979,15 @@ send_touch(IOHIDServiceClientRef screen, const struct redwood_touch *t)
 		if (!fingers[i].touching && i != f) {
 			continue;
 		}
-		finger = IOHIDEventCreateDigitizerFingerEvent(NULL, t->time, i + 1, i + 2,
+		/*
+		 * No pressure: the iPhone X whose user space this is has 3D Touch, and a finger that lands
+		 * at full pressure is a hard press there -- an icon's quick actions for every quick tap
+		 * (seen on the Galaxy S20+ with the whole iOS volume as the root). A touch screen without
+		 * force sensing says nothing about pressure.
+		 */
+		finger = IOHIDEventCreateDigitizerFingerEvent(NULL, t->time, i + 1, fingers[i].identity,
 		    (i == f ? change : 0) | (fingers[i].edge ? DIGITIZER_FROM_EDGE_TIP : 0), fingers[i].x, fingers[i].y, 0,
-		    fingers[i].touching ? 1.0 : 0.0, 0, fingers[i].touching, fingers[i].touching, 0);
+		    0.0, 0, fingers[i].touching, fingers[i].touching, 0);
 		IOHIDEventSetIntegerValue(finger, FIELD_DIGITIZER_DISPLAY_INTEGRATED, 1);
 		IOHIDEventAppendEvent(hand, finger, 0);
 		CFRelease(finger);

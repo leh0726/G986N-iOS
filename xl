@@ -22,6 +22,20 @@
 #   xl reload           restart the phone into a freshly built loader (after changing xnuloader/)
 #   xl memmap           the phone's memory map as its firmware reports it
 #   xl state            where is the phone right now
+#   xl logdump [F]      (phones booted through TWRP, from TWRP) read the notes the loader left in the log
+#                       partition: after a kernel that hung the phone (default logs/HHMMSS-logdump.txt)
+#   xl autoboot-image   a boot image that needs no computer: the loader starts the kernel by itself (a volume key
+#                       in its first two seconds: the USB commands instead), the root the iOS volume in darwin;
+#                       out/<device>-autoboot.img, from the kernel, userland/flashboot.apfs and userland/root.apfs
+#                       of FLASHBOOT=1 CRYPTEXES=flash, the profile's AUTOBOOT_ARGS
+#   xl install-autoboot (phones booted through TWRP, from TWRP) build that image and write it to the boot partition
+#   xl restore-boot F   (phones booted through TWRP) write the image F back to the boot partition --
+#                       the backup of Android's own boot image -- and restart the phone
+#
+# XL_DEVICE=<name> reads common/devices/<name>.conf (default: redwood, the values mkxnuimg.py has built
+# in). A profile with BOOT_VIA=twrp is a phone without fastboot (Samsung): `enter` writes the loader's
+# image to its boot partition from TWRP, after asking, and the phone then starts the loader on every
+# boot until `restore-boot` puts Android's back.
 #
 # Logs land in logs/. Environment for `run`:
 #   XL_CMDLINE  extra kernel boot-args; default "-v": the boot is shown as text on the phone's screen
@@ -50,6 +64,13 @@ K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bc
 L=xnuloader/loader.efi
 [ -f $L ] || L=prebuilt/loader.efi
 mkdir -p logs
+BOOT_VIA=fastboot
+if [ -n "$XL_DEVICE" ]; then
+	[ -f "common/devices/$XL_DEVICE.conf" ] || { echo "xl: no profile common/devices/$XL_DEVICE.conf" >&2; exit 1; }
+	# shellcheck disable=SC1090
+	. "common/devices/$XL_DEVICE.conf"
+	export UEFI_TARGET UEFI_FD DTB FD_BASE FD_SIZE PAYLOAD_BASE
+fi
 # There is one phone, whichever working copy (tools/new-workspace.sh) talks to it: the locks are
 # outside all of them.
 PHONE=${XDG_RUNTIME_DIR:-/tmp}/hackios-phone
@@ -63,8 +84,13 @@ is_loader() { in_fastboot && fb getvar product | grep -q 'product: xnuloader'; }
 state() {
 	if is_loader; then echo loader
 	elif in_fastboot; then echo fastboot
-	elif [ "$(adb get-state 2>/dev/null)" = device ]; then echo android
-	else echo absent; fi
+	else
+		case "$(adb get-state 2>/dev/null)" in
+		device) echo android ;;
+		recovery) echo recovery ;;
+		*) echo absent ;;
+		esac
+	fi
 }
 wait_for() { # wait_for <state> <seconds>
 	local i
@@ -72,7 +98,48 @@ wait_for() { # wait_for <state> <seconds>
 	return 1
 }
 
+# flash_boot <image>: from TWRP, write a boot image to the boot partition and read it back. It asks
+# first (XL_YES=1 answers for you): the partition holds Android's kernel, and Magisk with it.
+flash_boot() {
+	local img=$1 part=/dev/block/by-name/boot size psize want got answer
+	[ "$(state)" = recovery ] || { echo "xl: the phone is not in TWRP (state: $(state))"; return 1; }
+	[ "$(head -c 8 "$img" 2>/dev/null)" = "ANDROID!" ] || { echo "xl: $img is not an Android boot image"; return 1; }
+	size=$(stat -c %s "$img")
+	psize=$(adb shell blockdev --getsize64 $part | tr -d '\r')
+	[ -n "$psize" ] && [ "$size" -le "$psize" ] || { echo "xl: $img ($size bytes) does not fit $part (${psize:-?})"; return 1; }
+	if [ "$XL_YES" != 1 ]; then
+		echo "xl: about to write $img ($size bytes) to the phone's boot partition."
+		echo "    Android will not start until a backup of its boot image goes back (./xl restore-boot FILE)."
+		read -r -p "    type 'yes' to write it: " answer
+		[ "$answer" = yes ] || { echo "xl: nothing written"; return 1; }
+	fi
+	want=$(sha256sum "$img" | cut -d' ' -f1)
+	adb push "$img" /tmp/xl-boot.img >/dev/null || return 1
+	adb shell "dd if=/tmp/xl-boot.img of=$part bs=4096 conv=fsync 2>/dev/null && sync" || { echo "xl: dd failed"; return 1; }
+	got=$(adb shell "head -c $size $part | sha256sum" | cut -d' ' -f1)
+	adb shell rm -f /tmp/xl-boot.img
+	[ "$got" = "$want" ] || { echo "xl: read back $got, wrote $want -- the boot partition is not what was meant"; return 1; }
+	echo "xl: boot partition written and read back ($want)"
+}
+
+# A phone without fastboot: Android -> TWRP -> our image on the boot partition -> its loader.
+enter_twrp() {
+	case "$(state)" in
+	loader) return 0 ;;
+	android) adb reboot recovery; wait_for recovery 120 || { echo "xl: phone did not reach TWRP"; return 1; } ;;
+	recovery) ;;
+	*) echo "xl: phone not reachable (state: $(state)); start it into TWRP"; return 1 ;;
+	esac
+	xnuloader/mkpayload.py -o usb-payload.bin loader.efi=$L --usb >/dev/null &&
+		./mkxnuimg.py -p usb-payload.bin -o xnu-usb.img >/dev/null || { echo "xl: image build failed"; return 1; }
+	flash_boot xnu-usb.img || return 1
+	adb reboot
+	wait_for loader 90 && return 0
+	echo "xl: loader did not come up on USB (state: $(state))"; return 1
+}
+
 enter() {
+	[ "$BOOT_VIA" = twrp ] && { enter_twrp; return; }
 	case "$(state)" in
 	loader) return 0 ;;
 	android) adb reboot bootloader; wait_for fastboot 60 || { echo "xl: phone did not reach fastboot"; return 1; } ;;
@@ -93,6 +160,36 @@ enter() {
 		[ "$(state)" = fastboot ] || break
 	done
 	echo "xl: loader did not come up on USB (state: $(state))"; return 1
+}
+
+# autoboot_image: out/$XL_DEVICE-autoboot.img (see the list of commands at the top)
+# A run about Wi-Fi is given the radio's own address, which is the phone's and so is kept in a file that is
+# not in the repository: fw-wifi/mac (redwood) or fw-wifi-$XL_DEVICE/mac, one line, six bytes in hexadecimal
+# with colons. With it the kernel makes en0 as it starts (redwood_lx_net_early()): iOS looks for the
+# interface once, as it starts, and one that turns up later is not counted as Wi-Fi (the Galaxy S20+'s, made
+# when brcmfmac is up: Safari blank, no bars).
+with_wifi_mac() { # with_wifi_mac <args>
+	local args=$1 f=fw-wifi/mac
+	[ -s fw-wifi-${XL_DEVICE:-redwood}/mac ] && f=fw-wifi-${XL_DEVICE:-redwood}/mac
+	case " $args " in
+	*" wifi_mac="*) ;;
+	*" wifi="*|*" wifi_step="*) [ -s $f ] && args="$args wifi_mac=$(tr -d ' \n\r' < $f)" ;;
+	esac
+	echo "$args"
+}
+
+autoboot_image() {
+	local out=out/${XL_DEVICE:-redwood}-autoboot.img f
+	[ -n "$AUTOBOOT_ARGS" ] || { echo "xl: the profile has no AUTOBOOT_ARGS (XL_DEVICE=...)"; return 1; }
+	for f in userland/flashboot.apfs userland/root.apfs; do
+		[ -f $f ] || { echo "xl: no $f: build the images with FLASHBOOT=1 CRYPTEXES=flash"; return 1; }
+	done
+	mkdir -p out
+	xnuloader/mkpayload.py -o out/autoboot-payload.bin loader.efi=$L kernel=$K ramdisk=userland/root.apfs \
+		resident=userland/flashboot.apfs --cmdline "$(with_wifi_mac "$AUTOBOOT_ARGS")" >/dev/null &&
+		./mkxnuimg.py -p out/autoboot-payload.bin -o $out >/dev/null || { echo "xl: image build failed"; return 1; }
+	echo "xl: $out: kernel $K, args \"$AUTOBOOT_ARGS\"$(case "$(with_wifi_mac "$AUTOBOOT_ARGS")" in *wifi_mac=*) echo \
+		" and the radio's address" ;; esac)"
 }
 
 fetch_log() { # fetch_log <file>
@@ -134,12 +231,8 @@ run() { # run <oem command> <label>
 			echo "xl: nothing here recorded who uploaded the resident image;" \
 			     "if this run needs a particular one, upload it" >&2
 		fi
-		# A run about Wi-Fi is given the radio's own address, which is this phone's and so is kept in a
-		# file that is not in the repository: fw-wifi/mac, one line, six bytes in hexadecimal with colons.
-		local args=${XL_CMDLINE--v}
-		case " $args " in
-		*" wifi="*|*" wifi_step="*) [ -s fw-wifi/mac ] && args="$args wifi_mac=$(tr -d ' \n\r' < fw-wifi/mac)" ;;
-		esac
+		local args
+		args=$(with_wifi_mac "${XL_CMDLINE--v}")
 		xnuloader/mkpayload.py -o run-payload.bin kernel=$K ${rd:+ramdisk=$rd} --cmdline "loader_return_after=${XL_SECS:-8} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args" >/dev/null || return 1
 		FB_TIMEOUT=30 fb stage run-payload.bin | grep -q OKAY || { echo "xl: upload failed"; return 1; }
 	fi
@@ -165,6 +258,12 @@ run() { # run <oem command> <label>
 		done
 	else
 		result=$(FB_TIMEOUT=$(( ${XL_SECS:-8} + 100 )) fb getvar result | grep '^result:')
+	fi
+	if [ -z "$result" ] && [ "$BOOT_VIA" = twrp ]; then
+		# no watchdog is armed on these phones, and their boot partition holds the loader, not Android
+		echo "xl: no answer — the kernel hung. Force a restart straight into TWRP (the loader would overwrite"
+		echo "    the notes it kept), then: XL_DEVICE=$XL_DEVICE ./xl logdump"
+		return 2
 	fi
 	if [ -z "$result" ]; then
 		echo "xl: no answer — the kernel hung; waiting for the watchdog to reset the phone"
@@ -288,7 +387,17 @@ log) enter && fb oem log >/dev/null && fetch_log logs/loader.log && cat logs/loa
 stop) not_anothers_run stop && fb oem stop | grep -q OKAY && echo "xl: asked the kernel to come back" ;;
 memmap) enter && fb oem memmap >/dev/null && fb oem log >/dev/null && fetch_log logs/loader.log && sed -n '/^memory map/,$p' logs/loader.log ;;
 hang) enter && fb oem hang; echo "xl: waiting for the watchdog..."; t0=$(date +%s); wait_for android 150 && echo "xl: back in Android after $(( $(date +%s) - t0 )) s" || echo "xl: not back (state: $(state))" ;;
-reboot) not_anothers_run reboot && fb reboot ;;
+reboot) not_anothers_run reboot && fb reboot &&
+	{ [ "$BOOT_VIA" != twrp ] || echo "xl: the boot partition still holds the loader: back to Android with ./xl restore-boot FILE from TWRP"; } ;;
+logdump) [ "$(state)" = recovery ] || { echo "xl: the phone is not in TWRP (state: $(state))"; exit 1; }
+	# read only: what the loader wrote to the log partition before the phone stopped answering
+	f=${2:-logs/$(date +%H%M%S)-logdump.txt}
+	adb shell "dd if=/dev/block/by-name/logdump bs=4096 count=512 2>/dev/null" | tr -d '\0' > "$f" && cat "$f" ;;
+autoboot-image) autoboot_image ;;
+install-autoboot) autoboot_image && flash_boot out/${XL_DEVICE:-redwood}-autoboot.img && adb reboot &&
+	echo "xl: restarting into the loader: it starts the kernel in two seconds (a volume key: USB commands)" ;;
+restore-boot) [ -n "$2" ] || { echo "usage: xl restore-boot <Android's boot image>"; exit 1; }
+	flash_boot "$2" && adb reboot && echo "xl: restarting into Android" ;;
 reload) [ "$(state)" = loader ] && { fb reboot >/dev/null; wait_for android 120; }; enter && echo "xl: loader is up" ;;
 state) state ;;
 *) awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "$0" ;;

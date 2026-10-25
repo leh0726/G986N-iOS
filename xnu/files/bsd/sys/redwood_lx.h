@@ -83,6 +83,16 @@ void	 lx_os_irq_disable(unsigned vector);			/* returns when its function is not 
 void	 lx_os_irq_detach_all(void);				/* returns when no function is running */
 unsigned long long lx_os_irq_count(unsigned vector);		/* how many have arrived */
 
+/*
+ * ---- a radio on PCIe (the Galaxy S20+'s BCM4375, bsd/dev/redwood_pcie.c). lx_os_pci_up(): the link up
+ * from a cold radio and the card set up for a driver -- its vendor (low half) and device, its class and
+ * revision, its two memory BARs' physical addresses and sizes; 0, or an errno. Its configuration space
+ * is read and written 1, 2 or 4 bytes at a time.
+ */
+int	 lx_os_pci_up(unsigned *id, unsigned *class_revision, unsigned long long bar[2], unsigned long long bar_size[2]);
+unsigned lx_os_pci_config_read(unsigned offset, unsigned width);
+void	 lx_os_pci_config_write(unsigned offset, unsigned value, unsigned width);
+
 /* ---- the station: scanning and joining, for whoever asks the kernel (redwood_sta.h) ---- */
 void	 lx_os_station(const struct redwood_sta_ops *ops);	/* here it is, to be asked; NULL: no longer (returns when no call is under way) */
 void	 lx_os_station_lost(int error);				/* the network joined is gone by itself */
@@ -100,5 +110,10 @@ void	 lx_stop(void);
 int	 lx_transmit(const unsigned char *frame, unsigned long length);
 /* before lx_start(), if the kernel wants it early: take the memory the radio will be shown. 0, or an errno. */
 int	 lx_prepare(void);
+/* the same four of the Broadcom radio's object (tools/mk-brcmfmac.sh: Linux's brcmfmac), on the Galaxy S20+ */
+int	 lx_brcm_start(void);
+void	 lx_brcm_stop(void);
+int	 lx_brcm_transmit(const unsigned char *frame, unsigned long length);
+int	 lx_brcm_prepare(void);
 
 #endif

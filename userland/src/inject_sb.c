@@ -1071,6 +1071,82 @@ load_tweaks(void)
 	}
 }
 
+/*
+ * Boot-arg touch_trace=1: what SpringBoard makes of the touches -- every touch of every event it is
+ * sent (its phase, its own time stamp, and how late it is handled), and every gesture recognizer
+ * that begins or ends, by class. For the quick tap that was taken for a long press: whether the
+ * lift reaches SpringBoard in time, and what recognizes what.
+ */
+static void (*original_send_event)(id self, SEL selector, id event);
+static void (*original_set_state)(id self, SEL selector, long state);
+static unsigned traced;
+#define TRACE_LINES     600
+
+static double
+uptime_seconds(void)
+{
+	static mach_timebase_info_data_t base;
+
+	if (base.denom == 0) {
+		mach_timebase_info(&base);
+	}
+	return (double)mach_absolute_time() * base.numer / base.denom / 1e9;
+}
+
+static void
+traced_send_event(id self, SEL selector, id event)
+{
+	if (traced < TRACE_LINES && ((long (*)(id, SEL))objc_msgSend)(event, sel_registerName("type")) == 0) {
+		id touches = ((id (*)(id, SEL))objc_msgSend)(event, sel_registerName("allTouches"));
+		id all = touches ? ((id (*)(id, SEL))objc_msgSend)(touches, sel_registerName("allObjects")) : nil;
+		unsigned long count = all ? ((unsigned long (*)(id, SEL))objc_msgSend)(all, sel_registerName("count")) : 0;
+		double now = uptime_seconds();
+
+		for (unsigned long i = 0; i < count && traced < TRACE_LINES; i++) {
+			id touch = ((id (*)(id, SEL, unsigned long))objc_msgSend)(all, sel_registerName("objectAtIndex:"), i);
+			long phase = ((long (*)(id, SEL))objc_msgSend)(touch, sel_registerName("phase"));
+			double stamp = ((double (*)(id, SEL))objc_msgSend)(touch, sel_registerName("timestamp"));
+
+			traced++;
+			say("redwood: touch trace: %p phase %ld (0 began, 1 moved, 2 still, 3 ended, 4 cancelled) stamped %.3f, "
+			    "handled %.3f (%.0f ms late)\n", (void *)touch, phase, stamp, now, (now - stamp) * 1000);
+		}
+	}
+	original_send_event(self, selector, event);
+}
+
+static void
+traced_set_state(id self, SEL selector, long state)
+{
+	if (traced < TRACE_LINES && (state == 1 || state == 3 || state == 4)) {
+		traced++;
+		say("redwood: touch trace: %s %p -> %s at %.3f\n", object_getClassName(self), (void *)self,
+		    state == 1 ? "BEGAN" : state == 3 ? "ENDED/RECOGNIZED" : "CANCELLED", uptime_seconds());
+	}
+	original_set_state(self, selector, state);
+}
+
+static void
+trace_touches(void)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+	Method send, set;
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || strstr(args, "touch_trace=1") == NULL) {
+		return;
+	}
+	send = class_getInstanceMethod(objc_getClass("UIApplication"), sel_registerName("sendEvent:"));
+	set = class_getInstanceMethod(objc_getClass("UIGestureRecognizer"), sel_registerName("setState:"));
+	if (send != NULL) {
+		original_send_event = (void (*)(id, SEL, id))method_setImplementation(send, (IMP)traced_send_event);
+	}
+	if (set != NULL) {
+		original_set_state = (void (*)(id, SEL, long))method_setImplementation(set, (IMP)traced_set_state);
+	}
+	say("redwood: touch trace: events %s, gesture recognizers %s\n", send ? "traced" : "NOT", set ? "traced" : "NOT");
+}
+
 __attribute__((constructor))
 static void
 redwood_springboard_init(void)
@@ -1159,6 +1235,7 @@ redwood_springboard_init(void)
 	    0x1c48c2cf4UL, (IMP)ring_charging_level);
 	battery_lvl = (IMP)original_battery_level;
 	battery_st  = (IMP)original_battery_state;
+	trace_touches();
 	say("redwood: SpringBoard: activation %s, setup assistant %s, application snapshots %s, the side button's long press %s, "
 	    "battery level %s, battery state %s, poster switcher %s\n",
 	    activation ? "answered here" : "NOT replaced", original_set_setup_required_reason ? "refused" : "NOT replaced",

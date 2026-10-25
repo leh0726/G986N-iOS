@@ -70,14 +70,29 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm
 #define BLOCK_OP_WRITE     1u
 
 /*
- * Where a write may go, and nowhere else: darwin, the port's own 20 GiB at the end of logical
+ * Where a write may go, and nowhere else: darwin, the port's own partition at the end of logical
  * unit 0, and in it only past what the build puts there from the computer -- the iOS volume
  * (blocks 0..1374207) and the two cryptexes behind it (..2042367). The loader keeps the same
  * bounds and the GUIDs of the partition besides (xnuloader/loader.c, BLOCK_WRITE_FIRST).
  */
 #define UFS_WRITE_FIRST    2042368ULL                  /* darwin's blocks of 4096 */
-#define UFS_DARWIN_FIRST   25374720ULL                 /* its first LBA on the unit, as the GPT has it */
-#define UFS_DARWIN_BLOCKS  5242875ULL
+/*
+ * Where darwin is: each phone's own (the loader keeps the same, xnuloader/loader.c, struct platform).
+ * redwood: LBA 25374720 on, 20 GiB; y2q (Galaxy S20+): sda38, LBA 28904192 on, 128 GiB.
+ */
+static uint64_t ufs_darwin_first, ufs_darwin_blocks;
+
+static void
+ufs_darwin_place(void)
+{
+	if (redwood_platform_is("redwood")) {
+		ufs_darwin_first = 25374720ULL;
+		ufs_darwin_blocks = 5242875ULL;
+	} else if (redwood_platform_is("y2q")) {
+		ufs_darwin_first = 28904192ULL;
+		ufs_darwin_blocks = 33554683ULL;
+	}
+}
 
 struct loader_block_part {
 	char name[36];
@@ -1498,6 +1513,7 @@ redwood_ufs_init(void)
 	 */
 	check = 0;
 	if (PE_parse_boot_argn("ufs_write", &check, sizeof(check)) && check == 1) {
+		ufs_darwin_place();
 		uint32_t offered = ufs_page->write_part_plus_one;
 
 		if (offered == 0 || offered > ufs_parts || ufs_page->write_first != UFS_WRITE_FIRST) {
@@ -1519,9 +1535,11 @@ redwood_ufs_init(void)
 				 * has compared with the loader's reads; the device path this firmware gives
 				 * says no logical unit number at all, so part[].lun is 0xff for every unit */
 				why = "it is not on the first logical unit";
-			} else if (ufs_page->part[i].start_lba != UFS_DARWIN_FIRST) {
+			} else if (ufs_darwin_blocks == 0) {
+				why = "this phone has no darwin of the port's";
+			} else if (ufs_page->part[i].start_lba != ufs_darwin_first) {
 				why = "it does not begin where it did";
-			} else if (ufs_page->part[i].blocks != UFS_DARWIN_BLOCKS) {
+			} else if (ufs_page->part[i].blocks != ufs_darwin_blocks) {
 				why = "it is not the size it was";
 			} else if (ufs_page->part[i].block_size != 4096) {
 				why = "its blocks are not 4096 bytes";
@@ -1535,7 +1553,7 @@ redwood_ufs_init(void)
 		if (ufs_write_part >= 0) {
 			printf("ufs: /dev/rufs_darwin takes writes, whole blocks from %llu on (%llu MB of it); "
 			    "everything else of the storage is read only\n", UFS_WRITE_FIRST,
-			    (UFS_DARWIN_BLOCKS - UFS_WRITE_FIRST) * 4096 >> 20);
+			    (ufs_darwin_blocks - UFS_WRITE_FIRST) * 4096 >> 20);
 		} else {
 			printf("ufs: nothing takes writes: darwin is not among the partitions\n");
 		}

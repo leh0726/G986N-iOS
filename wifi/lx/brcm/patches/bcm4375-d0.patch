@@ -1,0 +1,16 @@
+--- a/brcmfmac/pcie.c	2026-10-25 10:18:39.510000374 +0900
++++ b/brcmfmac/pcie.c	2026-10-25 10:18:39.523314427 +0900
+@@ -1463,6 +1463,13 @@
+ 
+ 	brcmf_pcie_intr_enable(buspub->devinfo);
+ 	brcmf_pcie_hostready(buspub->devinfo);
++	/* The BCM4375's firmware is told that the host is awake and in use,
++	 * as Android's driver tells it: data frames do not come up without.
++	 */
++	if (buspub->devinfo->ci->chip == BRCM_CC_4375_CHIP_ID)
++		brcmf_dbg(PCIE, "BCM4375: D0 in use: %d\n",
++			  brcmf_pcie_send_mb_data(buspub->devinfo,
++					BRCMF_H2D_HOST_D0_INFORM_IN_USE));
+ 
+ 	return 0;
+ }

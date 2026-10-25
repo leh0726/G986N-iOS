@@ -525,6 +525,9 @@ struct platform {
 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
 	uint64_t fb_base;                /* the framebuffer the firmware reports (GOP): it tells this device apart */
+	/* the port's own partition "darwin" on logical unit 0, the one a write may reach (block_is_darwin): 0 for none */
+	uint64_t darwin_first, darwin_last;      /* its first and last LBA, as the GPT has them */
+	efi_guid darwin_unique;                  /* its unique GUID */
 };
 
 static const struct platform platform_qemu_virt = {
@@ -551,6 +554,21 @@ static const struct platform platform_redwood = {
 	 */
 	.small_cores = 0x0f,
 	.fb_base = 0xE1000000,
+	.darwin_first = 25374720, .darwin_last = 30617594,
+	.darwin_unique = { 0xfd6854ad, 0x24aa, 0x4fc3, { 0x94, 0xfe, 0x29, 0x01, 0x16, 0x85, 0x8d, 0x68 } },
+};
+
+static const struct platform platform_y2q = {
+	/* Galaxy S20+ 5G (SM8250): the same peripheral window and GIC as redwood, from its device tree. */
+	.name = "y2q", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
+	.cores = 8, .core_shift = 8,
+	/* Cores 0-3 are Cortex-A55s (Kryo 585 Silver), 4-6 A77s and 7 the prime A77 (capacity 0x766 vs 0x400). */
+	.small_cores = 0x0f,
+	.fb_base = 0x9C000000,           /* the UEFI's "Display Reserved" (cont_splash_region) */
+	/* sda38, 128 GiB at the end of LUN 0, made out of userdata's end (y2q-dump/pre-repartition) */
+	.darwin_first = 28904192, .darwin_last = 62458874,
+	.darwin_unique = { 0xed95d4da, 0xc7dc, 0x4d4a, { 0xa8, 0x74, 0x6a, 0xc0, 0x97, 0x8e, 0xb3, 0x85 } },
 };
 
 /*
@@ -560,6 +578,7 @@ static const struct platform platform_redwood = {
  */
 static const struct platform *const platforms[] = {
 	&platform_redwood,
+	&platform_y2q,
 };
 
 /* ------------------------------------------------------------------------ */
@@ -570,6 +589,18 @@ reboot(void)
 	hc_take_back("before the reset");
 	flush_log();
 	ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+	for (;;) {
+	}
+}
+
+/* The phone off, as the firmware turns it off (its ResetSystem: the PMIC lets go of the power). */
+static void __attribute__((noreturn))
+power_off(void)
+{
+	hc_take_back("before powering off");
+	print("the kernel asked for the phone to be turned off: off\n");
+	flush_log();
+	ST->rt->reset_system(2 /* EfiResetShutdown */, 0, 0, NULL);
 	for (;;) {
 	}
 }
@@ -873,7 +904,12 @@ struct kernel_live {
 	uint64_t stop;                  /* ours to write: the host wants the run to end ("oem stop") */
 	uint64_t magic2;                /* "XNULIVE2": the kernel is new enough to have what follows */
 	uint64_t sound;                 /* (a virtual address too) the same for a recording of the sound */
+	uint64_t power;                 /* KERNEL_POWER_TAG | off or restart: what iOS asked for at its end */
 };
+#define KERNEL_POWER_TAG        0x52574f5000000000ULL   /* "\0\0\0\0POWR": an older kernel has no such field */
+#define KERNEL_POWER_OFF        1
+#define KERNEL_POWER_RESTART    2
+static uint64_t kernel_power;           /* what the kernel that came back last asked for */
 
 /*
  * Battery state shared with XNU.  Qualcomm's charger firmware remains a UEFI
@@ -1489,10 +1525,8 @@ ufs_survey(void)
  * same partition, named the same, of the same size, in the same place, on logical unit 0.
  */
 #define BLOCK_WRITE_FIRST  2042368ULL                  /* darwin's blocks of 4096: past both cryptexes */
-#define BLOCK_DARWIN_FIRST 25374720ULL                 /* its first and last LBA of unit 0, as the GPT has them */
-#define BLOCK_DARWIN_LAST  30617594ULL
 #define BLOCK_DARWIN_TYPE  { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } }
-#define BLOCK_DARWIN_UNIQ  { 0xfd6854ad, 0x24aa, 0x4fc3, { 0x94, 0xfe, 0x29, 0x01, 0x16, 0x85, 0x8d, 0x68 } }
+/* where it is and its unique GUID are each phone's own: struct platform, darwin_first/last/unique */
 
 /*
  * The partitions first, then the logical units they are on (BLOCK_PART_UNIT, named unit0, unit1,
@@ -1832,7 +1866,8 @@ block_tables(void)
 static int
 block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const struct loader_block_part *bp)
 {
-	static const efi_guid type = BLOCK_DARWIN_TYPE, uniq = BLOCK_DARWIN_UNIQ;
+	static const efi_guid type = BLOCK_DARWIN_TYPE;
+	const efi_guid uniq = PLAT->darwin_unique;
 	static const char name[] = "darwin";
 	const char *why = NULL;
 
@@ -1845,13 +1880,15 @@ block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const s
 		why = "its type GUID is not the one it had";
 	} else if (memcmp(&info->unique_guid, &uniq, sizeof(uniq)) != 0) {
 		why = "its unique GUID is not the one it had";
-	} else if (info->start_lba != BLOCK_DARWIN_FIRST || info->end_lba != BLOCK_DARWIN_LAST) {
+	} else if (PLAT->darwin_last == 0) {
+		why = "this phone has no darwin of the port's";
+	} else if (info->start_lba != PLAT->darwin_first || info->end_lba != PLAT->darwin_last) {
 		why = "it does not begin and end where it did";
 	} else if (bp->unit != 0) {
 		/* the first unit UEFI lists: this firmware's device paths say no logical unit number
 		 * (device_path_print finds no 3.19 node), so bp->lun is 0xff for every unit */
 		why = "it is not on the first logical unit";
-	} else if (bp->block_size != 4096 || bp->blocks != BLOCK_DARWIN_LAST - BLOCK_DARWIN_FIRST + 1) {
+	} else if (bp->block_size != 4096 || bp->blocks != PLAT->darwin_last - PLAT->darwin_first + 1) {
 		why = "its blocks are not what they were";
 	} else if (bio->media->read_only) {
 		why = "UEFI gives it out read only";
@@ -2197,6 +2234,50 @@ charger_start(void)
 	    (uint64_t)charger_shared.charger_action);
 }
 
+/*
+ * The y2q's Wi-Fi enable, GPIO20 (dt: qcom,cnss-qca6490 wlan-en-gpio; output high, pull-up, 16 mA): its
+ * register resets the phone when the kernel reads it (bsd/dev/redwood_pcie.c, pcie_survey=2). UEFI's
+ * own pin driver may reach it where we do not: 1 reads it through that driver, 2 also makes it an
+ * output, drives it high and reads it back.
+ */
+#define PIN_WLAN_EN             20
+
+static void
+wlan_en_start(int how)
+{
+	static const efi_guid tlmm_guid = QCOM_TLMM_GUID;
+	struct qcom_tlmm *tlmm = NULL;
+	uint32_t input = TLMM_GPIO_CFG(PIN_WLAN_EN, 0, 0, TLMM_PULL_UP, TLMM_16MA);
+	uint32_t output = TLMM_GPIO_CFG(PIN_WLAN_EN, 0, 1, TLMM_PULL_UP, TLMM_16MA);
+	uint32_t value = 0xff;
+	efi_status status;
+
+	if (PLAT != &platform_y2q) {
+		return;
+	}
+	status = BS->locate_protocol(&tlmm_guid, NULL, (void **)&tlmm);
+	if (EFI_ERROR(status) || tlmm == NULL) {
+		print("wlan_en: no pin driver in UEFI (%x)\n", status);
+		return;
+	}
+	print("wlan_en: UEFI's pin driver, revision %d: about to read GPIO%d through it\n", tlmm->revision,
+	    (uint64_t)PIN_WLAN_EN);
+	flush_log();
+	status = tlmm->gpio_in(input, &value);
+	print("wlan_en: GPIO%d reads %d (%x)\n", (uint64_t)PIN_WLAN_EN, (uint64_t)value, status);
+	if (how < 2) {
+		return;
+	}
+	print("wlan_en: about to make GPIO%d an output and drive it high\n", (uint64_t)PIN_WLAN_EN);
+	flush_log();
+	status = tlmm->config_gpio(output, 1 /* TLMM_GPIO_ENABLE */);
+	print("wlan_en: configured (%x)\n", status);
+	status = tlmm->gpio_out(output, 1 /* GPIO_HIGH_VALUE */);
+	value = 0xff;
+	tlmm->gpio_in(output, &value);
+	print("wlan_en: driven high (%x); it reads %d now\n", status, (uint64_t)value);
+}
+
 /* For the record: how much the kernel on the other core has logged so far, and the end of it. */
 static void
 note_kernel_progress(const struct kernel_live *live, uint64_t slide, uint64_t seconds)
@@ -2502,6 +2583,8 @@ struct payload_info {
 	uint64_t checkpoint;
 	uint64_t forced_base;
 	uint64_t resident_rd;           /* size of a root image the host put at the resident address */
+	const uint8_t *resident;        /* "resident": an image that comes with the payload, for the resident address */
+	uint32_t resident_size;
 	int usb_mode;
 };
 
@@ -2553,6 +2636,9 @@ parse_payload(struct payload_info *pi, int verbose)
 			pi->resident_rd = parse_number(text, 16); /* e.g. loaded there by QEMU; see RESIDENT_RD_OFFSET */
 		} else if (str_eq(e->name, "checkpoint")) {
 			pi->checkpoint = parse_number(text, 10);  /* where the kernel should stop and come back */
+		} else if (str_eq(e->name, "resident")) {
+			pi->resident = p + sizeof(*e);            /* put at the resident address, as `xl ramdisk` would */
+			pi->resident_size = e->size;
 		} else if (str_eq(e->name, "usb")) {
 			pi->usb_mode = 1;                         /* stay in the loader and take commands over USB */
 		}
@@ -2795,6 +2881,16 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	if (pi.resident_rd != 0) {
 		resident_rd_size = pi.resident_rd;
 	}
+	/* a boot without the computer: the image that comes with the payload takes the resident one's place */
+	if (pi.resident != NULL && pi.resident_size != 0) {
+		if (RESIDENT_RD_OFFSET + pi.resident_size + RESIDENT_RD_RESERVE > win_size) {
+			print("the payload's resident image (%x bytes) does not fit the window\n", (uint64_t)pi.resident_size);
+			return 0;
+		}
+		memcpy((void *)(phys_base + RESIDENT_RD_OFFSET), pi.resident, pi.resident_size);
+		resident_rd_size = pi.resident_size;
+		print("resident image from the payload: %x bytes at %x\n", (uint64_t)pi.resident_size, phys_base + RESIDENT_RD_OFFSET);
+	}
 	if (resident_rd_size != 0) {
 		uint64_t res_pa = phys_base + RESIDENT_RD_OFFSET;
 		uint64_t res_size = (resident_rd_size + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
@@ -2853,6 +2949,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	int torch_requested = 0;
 	/* "cam=5" there too: the phone's wide camera is iOS's (bsd/dev/redwood_camera.c) */
 	int camera_requested = 0;
+	/* "wlan_en=1" (read) or "=2" (drive high): the y2q's Wi-Fi enable through UEFI's pin driver (wlan_en_start) */
+	int wlan_en_requested = 0;
 	/* (the loader stays for run after run: what the last run's arguments said must not hold for this one) */
 	gamut_p3 = 0;
 	/* a run that does not ask for writes does not get them, whatever an earlier run of this
@@ -2868,6 +2966,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		    (c[9] == 0 || c[9] == ' ');
 		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
 		camera_requested |= starts_with(c, "cam=5") && (c == pi.cmdline || c[-1] == ' ') && (c[5] == 0 || c[5] == ' ');
+		if (starts_with(c, "wlan_en=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '1' && c[8] <= '2') {
+			wlan_en_requested = c[8] - '0';
+		}
 		gamut_p3 |= starts_with(c, "gamut=p3") && (c == pi.cmdline || c[-1] == ' ');
 		if (starts_with(c, "ufs=") && (c == pi.cmdline || c[-1] == ' ') && c[4] >= '1' && c[4] <= '2' &&
 		    (c[5] == 0 || c[5] == ' ')) {
@@ -2881,6 +2982,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 	if (battery_requested) {
 		charger_start();
+	}
+	if (wlan_en_requested) {
+		wlan_en_start(wlan_en_requested);
 	}
 	if (ufs_requested >= 2) {
 		hc_init();              /* (ufs_native=: UEFI's transfer list kept, before anything reads) */
@@ -3379,6 +3483,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			sound_len = sound[1];
 			print("the kernel left a sound recording: %d bytes at %x\n", sound_len, sound[0]);
 		}
+	}
+	kernel_power = 0;
+	if (kernel_live != NULL && kernel_live->magic2 == KERNEL_LIVE_MAGIC2 && checkpoint != CHECKPOINT_SELFTEST &&
+	    (kernel_live->power & ~0xffULL) == KERNEL_POWER_TAG) {
+		kernel_power = kernel_live->power & 0xff;
+		print("the kernel ended with a request to %s the phone\n", kernel_power == KERNEL_POWER_OFF ? "turn off" :
+		    "restart");
 	}
 	const char *klog = (const char *)loader_ctx[CTX_LOG_PA];
 	uint64_t klog_len = loader_ctx[CTX_LOG_LEN];
@@ -3924,6 +4035,35 @@ ramfb_phone_screen(void)
 	SCREEN.stride = PHONE_WIDTH * 4;
 }
 
+#define AUTOBOOT_WAIT_MS        2000
+
+/* true if a volume key (an arrow) is pressed within AUTOBOOT_WAIT_MS */
+static int
+autoboot_interrupted(void)
+{
+	efi_text_input *in = ST->con_in;
+	efi_input_key key;
+
+	if (in == NULL) {
+		return 0;
+	}
+	print("autoboot: the kernel starts in %d s; a volume key now for the USB commands instead\n",
+	    (uint64_t)(AUTOBOOT_WAIT_MS / 1000));
+	flush_log();
+	while (in->read_key_stroke(in, &key) == 0) {
+		/* keys from before: not this choice */
+	}
+	for (unsigned ms = 0; ms < AUTOBOOT_WAIT_MS; ms += 10) {
+		if (in->read_key_stroke(in, &key) == 0 && (key.scan_code == 1 || key.scan_code == 2)) {
+			print("autoboot: volume %s pressed: USB commands\n", key.scan_code == 1 ? "up" : "down");
+			return 1;
+		}
+		BS->stall(10000);
+	}
+	print("autoboot: starting the kernel\n");
+	return 0;
+}
+
 efi_status EFIAPI
 efi_main(efi_handle image, efi_system_table *st)
 {
@@ -3961,14 +4101,28 @@ efi_main(efi_handle image, efi_system_table *st)
 	wdt_arm();
 
 	int have_payload = parse_payload(&pi, 0);
+	/*
+	 * A payload with a kernel and no "usb" is a boot without the computer (mkpayload.py --autoboot):
+	 * the kernel starts by itself. A volume key held in the first seconds takes the loader to its USB
+	 * commands instead, so that the phone can still be worked on from the computer.
+	 */
+	if (have_payload && !pi.usb_mode && pi.kernel != NULL && autoboot_interrupted()) {
+		pi.usb_mode = 1;
+	}
 	if (have_payload && pi.usb_mode && usb_start()) {
 		flush_log();
 		usb_command_loop();
 	}
 
-	/* One-shot mode: run the kernel that came with the image, then reset. */
+	/*
+	 * One-shot mode: run the kernel that came with the image, then reset -- or, when iOS was turned
+	 * off ("slide to power off"), turn the phone off.
+	 */
 	if (have_payload) {
 		run_kernel(0, 0);
+		if (kernel_power == KERNEL_POWER_OFF) {
+			power_off();
+		}
 	}
 	reboot();
 	return 0;

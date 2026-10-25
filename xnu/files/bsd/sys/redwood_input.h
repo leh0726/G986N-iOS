@@ -40,12 +40,16 @@ struct redwood_touch {
 void redwood_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
 void redwood_input_init(void);
 void redwood_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
+bool redwood_platform_is(const char *name); /* the loader's platform name (/arm-io device_type) is this */
 void redwood_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
+void redwood_sec_ts_init(void);         /* boot-arg touchscreen=1 on the Galaxy S20+: its Samsung touch controller */
 void redwood_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
 void redwood_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
 void redwood_ufs_report(const char *when); /* where reading the storage has spent its time so far */
 bool redwood_ufs_dev(dev_t dev);           /* one of the storage's devices */
 void redwood_battery_init(void);        /* boot-arg battery=1: Qualcomm UEFI charger state shared by xnuloader */
+void redwood_max77705_init(void);       /* boot-arg max77705=1 on the Galaxy S20+: its fuel gauge and charger, read directly */
+void redwood_pcie_init(void);           /* boot-arg pcie_step=N on the Galaxy S20+: the first N steps of its Wi-Fi's PCIe link */
 int redwood_battery_temperature(void);  /* the battery's temperature in C, -273 while it is not known */
 /* one transfer at a time through the PMIC arbiter for this system (bsd/dev/redwood_buttons.c) */
 void redwood_spmi_lock(void);
@@ -95,10 +99,16 @@ void redwood_lx_net_early(void);        /* ... and en0 made on the radio now, if
 bool redwood_wifi_dsp_is_up(void);      /* the DSP that runs the radio's firmware has been started and has a link */
 const uint8_t *redwood_wifi_driver_file(const char *name, uint64_t *size);     /* a file by the name Linux has for it */
 bool redwood_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *address); /* memory shown to the radio */
+void redwood_wifi_radio_faults(void);   /* ... and what the SMMU has refused it, to the log */
 bool redwood_wifi_radio_msi(unsigned long long *address, uint32_t *data, uint32_t *first_spi); /* where the radio raises its interrupts */
 bool redwood_wifi_radio_address(uint8_t *address);      /* the radio's own address (boot-arg wifi_mac), if one was given */
 /* the network to join (fw/network of the small image): name and passphrase, buffer sizes in and lengths out */
 bool redwood_wifi_network(uint8_t *name, unsigned *name_length, uint8_t *passphrase, unsigned *passphrase_length);
+/* the Galaxy S20+'s Broadcom radio on PCIe0 (bsd/dev/redwood_pcie.c), for its driver (redwood_lx.c) */
+bool redwood_pcie_radio_up(uint32_t *id, uint32_t *class_revision, uint64_t bar[2], uint64_t bar_size[2]); /* from cold, card set up */
+uint32_t redwood_pcie_config_read(uint32_t offset, unsigned width);    /* the card's configuration space: 1, 2 or 4 bytes */
+void redwood_pcie_config_write(uint32_t offset, uint32_t value, unsigned width);
+void redwood_pcie_radio_down(void);     /* PERST and WL_REG_ON low, if they were driven: the next run finds the radio cold */
 
 /*
  * The GPU kept on (boot-arg adreno_keep=1), for iokit/Kernel/RedwoodGPU.cpp: see "the GPU kept on"

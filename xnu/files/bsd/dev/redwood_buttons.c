@@ -48,6 +48,7 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
+#include <pexpert/device_tree.h>
 #include <sys/redwood_input.h>
 #include <sys/systm.h>
 
@@ -152,6 +153,50 @@ struct peripheral {
 static struct peripheral pon = { .name = "the PMK8350's power-on block", .id = 0x013 };          /* registers 0x1300 of slave 0 */
 static struct peripheral pin = { .name = "GPIO6 of the PM7325", .id = 0x18d };                   /* registers 0x8d00 of slave 1 */
 
+/*
+ * Where the keys are on each phone, picked by the device_type the loader gives /arm-io (its
+ * platform's name). The arbiter is the same block at the same addresses on both SoCs; the keys
+ * are on other PMICs, and the power-on block of the Galaxy S20+ is of the older kind ("generation
+ * 2", Linux drivers/input/misc/qpnp-power-on.c), with the two keys in the low bits of its status.
+ */
+static struct keys {
+	const char *    platform;
+	const char *    pon_name;
+	uint16_t        pon_id;
+	uint8_t         pon_subtype_from, pon_subtype_to;
+	uint8_t         kpdpwr, resin;          /* in the power-on block's status */
+	const char *    pin_name;
+	uint16_t        pin_id;
+} keys_table[] = {
+	{ "redwood", "the PMK8350's power-on block", 0x013, 0x09, 0x09, 0x80, 0x40, "GPIO6 of the PM7325", 0x18d },
+	/* Galaxy S20+ 5G: PM8150 (slave 0) power-on@800, pon-type 0 and 1; volume up is GPIO3 of the PM8150L (slave 4) */
+	{ "y2q", "the PM8150's power-on block", 0x008, 0x04, 0x05, 0x01, 0x02, "GPIO3 of the PM8150L", 0x4c2 },
+}, *keys = &keys_table[0];
+
+static void
+keys_choose(void)
+{
+	DTEntry entry;
+	void const *type;
+	unsigned int size;
+
+	if (SecureDTLookupEntry(NULL, "/arm-io", &entry) != kSuccess ||
+	    SecureDTGetProperty(entry, "device_type", &type, &size) != kSuccess) {
+		return;
+	}
+	for (unsigned i = 0; i < sizeof(keys_table) / sizeof(keys_table[0]); i++) {
+		if (strncmp(type, keys_table[i].platform, size) == 0) {
+			keys = &keys_table[i];
+		}
+	}
+	pon.name = keys->pon_name;
+	pon.id = keys->pon_id;
+	pin.name = keys->pin_name;
+	pin.id = keys->pin_id;
+	printf("buttons: keys of %s: %s (slave %u, peripheral %#x), %s (slave %u, peripheral %#x)\n", keys->platform, pon.name,
+	    pon.id >> 8, pon.id & 0xff, pin.name, pin.id >> 8, pin.id & 0xff);
+}
+
 /* How the reads have gone: said once a minute. */
 static struct {
 	uint64_t reads, failed, total_ns, longest_ns, last_ns;
@@ -247,9 +292,8 @@ find_channel(struct peripheral *p, uint32_t channels)
 
 /* the power-on block, of the kind that is split in two ("generation 3"): this is its half for the operating system */
 #define PON_TYPE                0x01
-#define PON_SUBTYPE_HLOS        0x09
-#define PON_KPDPWR              0x80            /* in the status and in the interrupt registers */
-#define PON_RESIN               0x40
+#define PON_KPDPWR              (keys->kpdpwr)  /* in the status and in the interrupt registers */
+#define PON_RESIN               (keys->resin)
 
 /* a GPIO of the low or medium voltage kind */
 #define GPIO_TYPE               0x10
@@ -386,7 +430,8 @@ pon_inputs(void)
 	const char *problem;
 	uint8_t r[8], more[2];
 
-	printf("buttons: next: read the status and the interrupt setup of %s (registers 0x1310 to 0x1319)\n", pon.name);
+	printf("buttons: next: read the status and the interrupt setup of %s (registers 0x%02x10 to 0x%02x19)\n", pon.name,
+	    pon.id & 0xff, pon.id & 0xff);
 	problem = spmi_read(&pon, REG_RT_STATUS, r, 8);
 	if (problem == NULL) {
 		problem = spmi_read(&pon, REG_INT_LATCHED, more, 2);
@@ -412,7 +457,8 @@ pin_input(void)
 	uint8_t c[8], status = 0;
 	unsigned mode, pull;
 
-	printf("buttons: next: read the setup and the level of %s (registers 0x8d40 to 0x8d47, 0x8d10)\n", pin.name);
+	printf("buttons: next: read the setup and the level of %s (registers 0x%02x40 to 0x%02x47, 0x%02x10)\n", pin.name,
+	    pin.id & 0xff, pin.id & 0xff, pin.id & 0xff);
 	problem = spmi_read(&pin, GPIO_REG_MODE, c, 8);
 	if (problem == NULL) {
 		problem = spmi_read(&pin, REG_RT_STATUS, &status, 1);
@@ -453,6 +499,7 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	uint32_t steps = (uint32_t)(uintptr_t)parameter, version, channels;
 	bool pon_known, pin_known;
 
+	keys_choose();
 	printf("buttons: step 1: map the PMIC arbiter (%#lx, %#lx, %#lx) and read its version\n", ARB_CORE_PHYS, ARB_CNFG_PHYS,
 	    ARB_OBSERVER_PHYS);
 	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
@@ -480,7 +527,7 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	}
 
 	printf("buttons: step 3: the first transfers on the SPMI bus\n");
-	pon_known = identify(&pon, PON_TYPE, PON_SUBTYPE_HLOS, PON_SUBTYPE_HLOS);
+	pon_known = identify(&pon, PON_TYPE, keys->pon_subtype_from, keys->pon_subtype_to);
 	pin_known = identify(&pin, GPIO_TYPE, GPIO_SUBTYPE_LV, GPIO_SUBTYPE_MV_VIN3);
 	if (steps < 4) {
 		goto out;

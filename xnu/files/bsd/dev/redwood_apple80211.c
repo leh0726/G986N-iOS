@@ -201,6 +201,7 @@ static LCK_GRP_DECLARE(apple80211_lock_group, "redwood-apple80211");
 static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
 static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
 static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
+static char country_code[3] = "XZ";             /* what wifid last set (COUNTRY_CODE): "XZ", the world's, until it does */
 
 /* ---- channels ---------------------------------------------------------------------------------------- */
 
@@ -324,6 +325,17 @@ get(struct apple80211req *request)
 	case 15:                                /* the mode: a station (APPLE80211_M_STA) */
 		request->req_val = 1;
 		return 0;
+	case 51: {                              /* the country code wifid set last (apple80211_country_code_data) */
+		struct {
+			uint32_t version;
+			char cc[3];
+		} answer = { .version = 1 };
+
+		lck_mtx_lock(&apple80211_lock);
+		memcpy(answer.cc, country_code, sizeof(answer.cc));
+		lck_mtx_unlock(&apple80211_lock);
+		return give(request, &answer, sizeof(answer));
+	}
 	case 27:
 	case 254: {                             /* the channels the radio may tune to */
 		struct apple80211_channels *answer;
@@ -430,6 +442,65 @@ get(struct apple80211req *request)
 		} answer = { .version = 1, .radios = 1, .each = { state->bss.rssi }, .all = state->bss.rssi,
 			     .each_ext = { state->bss.rssi }, .all_ext = state->bss.rssi };
 
+		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+		break;
+	}
+	/*
+	 * What wifid asks of the link once joined (apple80211_ioctl.h's structures), as IO80211Family drivers
+	 * answer: refused, it has no measure of the link (no bars in the status bar) and the captive network
+	 * check of the network joined waits on it. Plausible values, the same for any radio: the drivers
+	 * underneath say nothing of noise, rate or modulation.
+	 */
+	case 17: {                              /* the noise floor: dBm, laid out as RSSI's answer */
+		struct {
+			uint32_t version, radios, unit;
+			int32_t each[4], all, each_ext[4], all_ext;
+		} answer = { .version = 1, .radios = 1, .each = { -92 }, .all = -92, .each_ext = { -92 }, .all_ext = -92 };
+
+		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+		break;
+	}
+	case 8: {                               /* the rate: Mbit/s, per radio */
+		struct {
+			uint32_t version, radios, rate[4];
+		} answer = { .version = 1, .radios = 1, .rate = { state->bss.frequency > 4000 ? 866 : 144 } };
+
+		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+		break;
+	}
+	case 14: {                              /* the PHY modes: supported (a, b, g, n, ac) and in use (n, or ac at 5 GHz) */
+		struct {
+			uint32_t version, modes, active;
+		} answer = { .version = 1, .modes = 0x2 | 0x4 | 0x8 | 0x10 | 0x80, .active = state->bss.frequency > 4000 ? 0x80 : 0x10 };
+
+		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+		break;
+	}
+	case 57: {                              /* the modulation and coding (MCS) index */
+		struct {
+			uint32_t version, index;
+		} answer = { .version = 1, .index = 7 };
+
+		request->req_val = 7;
+		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+		break;
+	}
+	case 5:                                 /* power save (level 0: none) */
+	case 18: {                              /* interference mitigation (0: off) */
+		struct {
+			uint32_t version, value;
+		} answer = { .version = 1 };
+
+		request->req_val = 0;
+		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+		break;
+	}
+	case 6: {                               /* protection (none) and its threshold */
+		struct {
+			uint32_t version, mode, threshold;
+		} answer = { .version = 1 };
+
+		request->req_val = 0;
 		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
 		break;
 	}
@@ -589,6 +660,22 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 	}
 	case 10:
 		return set_scan(request, said, said_size);
+	case 51: {                              /* the country (wifid's locale, from what access points say: 802.11d) */
+		struct {
+			uint32_t version;
+			char cc[3];
+		} asked;
+		int error;
+
+		if (request->req_len < sizeof(asked) || (error = copyin(request->req_data, &asked, sizeof(asked))) != 0) {
+			return request->req_len < sizeof(asked) ? EINVAL : error;
+		}
+		snprintf(said, said_size, " (the country: %.2s)", asked.cc);
+		lck_mtx_lock(&apple80211_lock);
+		memcpy(country_code, asked.cc, sizeof(country_code));
+		lck_mtx_unlock(&apple80211_lock);
+		return 0;
+	}
 	default:
 		return EOPNOTSUPP;
 	}
