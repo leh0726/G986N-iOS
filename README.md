@@ -1,5 +1,7 @@
 **English** | [한국어](README.ko.md)
 
+# WARNING: THIS IS VIBE-CODED. DO NOT USE THIS IF YOU MATTER.
+
 # G986N-iOS — iOS 16.5 on the Galaxy S20+ (SM-G986N)
 
 This repository runs Apple's open-source **XNU kernel** (`xnu-8796.121.2`, the kernel of iOS 16.5) and the
