@@ -28,6 +28,7 @@ hackios-xnu-kernel과 [hackios-xnu-userland](https://github.com/oosexgang/hackio
 - **Wi-Fi:** 네트워크가 검색되고 연결까지 되지만, 인터넷이 응답하지 않는다.
 - **충전:** 배터리는 방전만 되고 충전은 안 된다. 기기를 충전하려면 TWRP로 부팅해야 한다.
 - **밝기 조절, 화면 끄기**
+- **시스템 종료:** 강제 재부팅 후 TWRP로 진입해 전원을 꺼야 합니다.
 
 ## 저장소에 없는 것과 되살리는 방법
 
