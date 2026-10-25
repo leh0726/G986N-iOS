@@ -18,11 +18,16 @@ iOS 16.5 starts from the phone's boot partition by itself, without a computer (`
 
 - **Root:** the iOS volume on the phone's flash; data that iOS writes is kept across boots.
 - **GPU:** the Adreno 650 draws for CoreAnimation through Mesa/freedreno (`gpu=1`).
-- **Wi-Fi:** the BCM4375 through Linux's brcmfmac on a compatibility layer (`wifi=1`, [docs/y2q-wifi.md](docs/y2q-wifi.md)).
 - **Display:** frames are page-flipped and enlarged by the display controller's own pipes, at the panel's 60 Hz
   ([docs/y2q-display.md](docs/y2q-display.md)).
-- **Also:** the touch screen, the battery and charger readings (MAX77705), up to 8 CPU cores.
-- **Not yet:** brightness and turning the display off.
+- **Also:** the touch screen, the battery readings (MAX77705), up to 8 CPU cores.
+
+
+## What does not work on the y2q
+
+- **Wi-Fi:** It can scan and connect to the network, but internet does not respond.
+- **Charging:** Phone only discharges, and you should boot to TWRP to charge the battery.
+- **Brightness/Display Off**
 
 ## What the repository leaves out, and how it comes back
 
