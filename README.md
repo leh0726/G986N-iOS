@@ -29,6 +29,7 @@ iOS 16.5 starts from the phone's boot partition by itself, without a computer (`
 - **Wi-Fi:** It can scan and connect to the network, but internet does not respond.
 - **Charging:** Phone only discharges, and you should boot to TWRP to charge the battery.
 - **Brightness/Display Off**
+- **Shutting Down the System:** You should force reboot, Enter TWRP and shut the phone down.
 
 ## What the repository leaves out, and how it comes back
 
